@@ -1,0 +1,14 @@
+# données locales et binaires
+/data/
+/dist/
+*.exe
+pellicule-linux-*
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.kotlin/
+# clé de signature : à garder hors du dépôt (sauvegarde-la à part)
+android/*.jks
