@@ -1,0 +1,57 @@
+# Compile le serveur (Linux arm64 + amd64) et l'APK Android à chaque tag vX.Y.Z,
+# puis publie le tout dans une release GitHub.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: APK Android
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/pellicule.jks"
+          export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/pellicule.jks"
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease -PappVersion=${{ steps.v.outputs.version }}
+
+      - name: Serveur + archive
+        run: bash build.sh ${{ steps.v.outputs.version }}
+
+      - name: Release GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk "dist/pellicule-android-$V.apk"
+          gh release create "$GITHUB_REF_NAME" --title "Pellicule $V" --generate-notes \
+            "dist/pellicule-$V.tar.gz" "dist/pellicule-android-$V.apk" \
+            || gh release upload "$GITHUB_REF_NAME" --clobber \
+            "dist/pellicule-$V.tar.gz" "dist/pellicule-android-$V.apk"
