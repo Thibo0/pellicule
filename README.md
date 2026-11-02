@@ -33,7 +33,7 @@ Pour copier l'archive depuis un PC : `scp pellicule-*.tar.gz utilisateur@IP-de-l
 
 ### App Android (recommandé)
 
-Installer `pellicule-android.apk` sur le téléphone (l'envoyer par mail/Drive/câble, l'ouvrir, autoriser
+Installer `pellicule-android-<version>.apk` sur le téléphone (l'envoyer par mail/Drive/câble, l'ouvrir, autoriser
 « installer des applis inconnues »). Au premier lancement : adresse du serveur (ex. `192.168.1.50:8420`),
 utilisateur, mot de passe, puis autoriser l'accès à **toutes** les photos.
 

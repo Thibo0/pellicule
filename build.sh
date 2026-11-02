@@ -10,9 +10,10 @@ for arch in arm64 amd64; do
   CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "$OUT/pellicule-linux-$arch" .
 done
 cp deploy/install.sh README.md "$OUT/"
-# app Android (compilée à part : cd android && ./gradlew assembleRelease)
+sed "s/{{VERSION}}/$VERSION/g" deploy/INSTALLATION.md > "$OUT/INSTALLATION.md"
+# app Android (compilée à part : cd android && ./gradlew assembleRelease -PappVersion=<version>)
 APK=android/app/build/outputs/apk/release/app-release.apk
-[ -f "$APK" ] && cp "$APK" "$OUT/pellicule-android.apk"
+if [ -f "$APK" ]; then cp "$APK" "$OUT/pellicule-android-$VERSION.apk"; fi
 chmod +x "$OUT/install.sh" "$OUT"/pellicule-linux-*
 tar -C dist -czf "dist/pellicule-$VERSION.tar.gz" "pellicule-$VERSION"
 ls -lh "dist/pellicule-$VERSION.tar.gz"
