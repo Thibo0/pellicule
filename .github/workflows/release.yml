@@ -13,22 +13,26 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # actions épinglées par commit : un tag déplacé ne peut pas changer ce qui s'exécute ici
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Version
         id: v
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-java@v5
+      - name: Tests du serveur avant publication
+        run: go vet ./... && go test -count=1 ./...
+
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: "17"
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
 
       - name: APK Android
         working-directory: android
@@ -40,7 +44,7 @@ jobs:
           echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/pellicule.jks"
           export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/pellicule.jks"
           chmod +x gradlew
-          ./gradlew --no-daemon assembleRelease -PappVersion=${{ steps.v.outputs.version }}
+          ./gradlew --no-daemon testDebugUnitTest assembleRelease -PappVersion=${{ steps.v.outputs.version }}
 
       - name: Serveur + archive
         run: bash build.sh ${{ steps.v.outputs.version }}
@@ -51,8 +55,9 @@ jobs:
           V: ${{ steps.v.outputs.version }}
         run: |
           cp android/app/build/outputs/apk/release/app-release.apk "dist/pellicule-android-$V.apk"
+          (cd dist && sha256sum "pellicule-$V.tar.gz" "pellicule-android-$V.apk" > SHA256SUMS)
           sed "s/{{VERSION}}/$V/g" deploy/INSTALLATION.md > notes.md
           gh release create "$GITHUB_REF_NAME" --title "Pellicule $V" --notes-file notes.md --generate-notes \
-            "dist/pellicule-$V.tar.gz" "dist/pellicule-android-$V.apk" \
+            "dist/pellicule-$V.tar.gz" "dist/pellicule-android-$V.apk" dist/SHA256SUMS \
             || gh release upload "$GITHUB_REF_NAME" --clobber \
-            "dist/pellicule-$V.tar.gz" "dist/pellicule-android-$V.apk"
+            "dist/pellicule-$V.tar.gz" "dist/pellicule-android-$V.apk" dist/SHA256SUMS

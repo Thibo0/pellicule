@@ -1,8 +1,15 @@
 package main
 
+// Photos et vidéos. Tout arrive déjà chiffré par le client : le serveur range des blobs opaques.
+//
+// Envoi en trois temps, reprenable :
+//   1. POST /api/assets              clé du fichier (chiffrée), métadonnées (chiffrées), empreintes HMAC
+//   2. PUT  /api/assets/{id}/original?offset=N   l'original chiffré, par morceaux, dans l'ordre
+//      PUT  /api/assets/{id}/thumb | /preview    miniature et aperçu chiffrés
+//   3. POST /api/assets/{id}/complete
+// Sur le disque : <library>/u<id>/<id/1000>/<id>.o (original), .m (aperçu), .s (miniature).
+
 import (
-	"archive/zip"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -10,7 +17,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,178 +24,247 @@ import (
 	"time"
 )
 
-// --- envoi ---
+const (
+	maxOriginal  = 64 << 30 // 64 Gio
+	maxPart      = 32 << 20 // un morceau d'envoi
+	maxThumb     = 2 << 20
+	maxPreview   = 16 << 20
+	maxMeta      = 64 << 10
+	staleUploads = 24 * time.Hour
+)
 
-type uploadResult struct {
-	Status string `json:"status"` // "created" ou "duplicate"
-	Asset  Asset  `json:"asset"`
+func userDir(id int64) string { return fmt.Sprintf("u%d", id) }
+
+// blobPath : variant "o" (original), "m" (aperçu), "s" (miniature), "o.part" (envoi en cours).
+func (a *App) blobPath(owner, id int64, variant string) string {
+	return filepath.Join(a.libDir, userDir(owner), strconv.FormatInt(id/1000, 10), fmt.Sprintf("%d.%s", id, variant))
 }
 
-func (a *App) handleUpload(w http.ResponseWriter, r *http.Request, u *User) {
-	mr, err := r.MultipartReader()
-	if err != nil {
-		httpError(w, http.StatusBadRequest, "envoi multipart attendu")
+func validTag(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+// --- 1. création ---
+
+func (a *App) handleCreateAsset(w http.ResponseWriter, r *http.Request, u *User) {
+	var b struct {
+		Kind      string `json:"kind"`
+		TakenAt   int64  `json:"takenAt"`
+		FK        []byte `json:"fk"`
+		Meta      []byte `json:"meta"`
+		DedupTag  string `json:"dedupTag"`
+		DeviceTag string `json:"deviceTag"`
+		Size      int64  `json:"size"`
+	}
+	if !readJSON(w, r, &b) {
 		return
 	}
-	var mtime int64
-	for {
-		part, err := mr.NextPart()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			httpError(w, http.StatusBadRequest, "envoi interrompu")
-			return
-		}
-		switch part.FormName() {
-		case "mtime":
-			b, _ := io.ReadAll(io.LimitReader(part, 32))
-			mtime, _ = strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
-		case "file":
-			res, err := a.saveUpload(u, part, part.FileName(), mtime)
-			part.Close()
-			if err != nil {
-				var ue userError
-				if errors.As(err, &ue) {
-					httpError(w, http.StatusUnsupportedMediaType, ue.Error())
-				} else {
-					serverError(w, err)
-				}
-				return
-			}
-			writeJSON(w, res)
-			return
-		}
-		part.Close()
+	if (b.Kind != "image" && b.Kind != "video") || len(b.FK) != boxSize || len(b.Meta) < NonceSize+TagSize ||
+		len(b.Meta) > maxMeta || !validTag(b.DedupTag) || (b.DeviceTag != "" && !validTag(b.DeviceTag)) ||
+		b.Size < StreamHdrSize+TagSize || b.Size > maxOriginal {
+		httpError(w, http.StatusBadRequest, "requête invalide")
+		return
 	}
-	httpError(w, http.StatusBadRequest, "aucun fichier reçu")
+	if free := diskFree(a.libDir); free > 0 && free < b.Size+512<<20 {
+		httpError(w, http.StatusInsufficientStorage, "disque plein")
+		return
+	}
+
+	var id, uploaded int64
+	var complete bool
+	var trashed sql.NullInt64
+	err := a.db.QueryRow(`SELECT id, uploaded, complete, trashed_at FROM assets WHERE owner_id=? AND dedup_tag=?`, u.ID, b.DedupTag).
+		Scan(&id, &uploaded, &complete, &trashed)
+	switch {
+	case err == nil && complete:
+		if trashed.Valid { // renvoyer une photo mise à la corbeille la restaure
+			a.db.Exec(`UPDATE assets SET trashed_at=NULL WHERE id=?`, id)
+			a.writeAssetFiles(id)
+		}
+		writeJSON(w, map[string]any{"status": "duplicate", "id": id})
+		return
+	case err == nil: // envoi interrompu : on reprend où il en était
+		writeJSON(w, map[string]any{"status": "resume", "id": id, "uploaded": uploaded})
+		return
+	case !errors.Is(err, sql.ErrNoRows):
+		serverError(w, err)
+		return
+	}
+
+	if b.TakenAt <= 0 {
+		b.TakenAt = time.Now().UnixMilli()
+	}
+	res, err := a.db.Exec(`INSERT INTO assets(owner_id, kind, taken_at, wrapped_fk, meta, dedup_tag, device_tag, orig_size, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?)`, u.ID, b.Kind, b.TakenAt, b.FK, b.Meta, b.DedupTag, b.DeviceTag, b.Size, time.Now().UnixMilli())
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	id, _ = res.LastInsertId()
+	a.writeAssetFiles(id)
+	writeJSON(w, map[string]any{"status": "created", "id": id, "uploaded": 0})
 }
 
-type userError string
+// --- 2. contenu ---
 
-func (e userError) Error() string { return string(e) }
+type assetState struct {
+	owner, size, uploaded int64
+	complete              bool
+}
 
-func (a *App) saveUpload(u *User, src io.Reader, name string, mtimeMs int64) (*uploadResult, error) {
-	name = cleanFilename(name)
-	kind, mime, ok := mediaType(name)
+func (a *App) ownedState(w http.ResponseWriter, r *http.Request, u *User) (int64, assetState, bool) {
+	id, ok := pathID(w, r)
 	if !ok {
-		return nil, userError("format non pris en charge : " + name)
+		return 0, assetState{}, false
 	}
-
-	tmp, err := os.CreateTemp(filepath.Join(a.libDir, ".tmp"), "up-*")
+	var s assetState
+	err := a.db.QueryRow(`SELECT owner_id, orig_size, uploaded, complete FROM assets WHERE id=? AND owner_id=?`, id, u.ID).
+		Scan(&s.owner, &s.size, &s.uploaded, &s.complete)
 	if err != nil {
-		return nil, err
+		httpError(w, http.StatusNotFound, "introuvable")
+		return 0, s, false
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath) // sans effet une fois le fichier déplacé
-
-	h := sha256.New()
-	size, err := io.Copy(io.MultiWriter(tmp, h), src)
-	if cerr := tmp.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return nil, err
-	}
-	if size == 0 {
-		return nil, userError("fichier vide : " + name)
-	}
-	sum := hex.EncodeToString(h.Sum(nil))
-	deviceKey := fmt.Sprintf("%s|%d", strings.ToLower(name), size)
-
-	if existing, err := scanAsset(a.db.QueryRow(`SELECT `+assetCols+` FROM assets a WHERE owner_id=? AND sha256=?`, u.ID, sum)); err == nil {
-		if existing.TrashedAt != nil {
-			// renvoyer une photo mise à la corbeille la restaure
-			a.db.Exec(`UPDATE assets SET trashed_at=NULL WHERE id=?`, existing.ID)
-			existing.TrashedAt = nil
-		}
-		return &uploadResult{Status: "duplicate", Asset: existing}, nil
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-
-	// date provisoire (affinée par le worker) : EXIF du JPEG, sinon date du fichier côté appareil
-	taken := quickTakenAt(tmpPath, mime)
-	if taken.IsZero() && mtimeMs > 0 {
-		taken = wallClock(time.UnixMilli(mtimeMs))
-	}
-	if taken.IsZero() {
-		taken = wallClock(time.Now())
-	}
-
-	relDir := filepath.Join(u.Username, taken.Format("2006"), taken.Format("01"))
-	if err := os.MkdirAll(filepath.Join(a.libDir, relDir), 0o755); err != nil {
-		return nil, err
-	}
-	rel, err := uniquePath(a.libDir, relDir, name)
-	if err != nil {
-		return nil, err
-	}
-	os.Chmod(tmpPath, 0o644)
-	if err := os.Rename(tmpPath, filepath.Join(a.libDir, rel)); err != nil {
-		return nil, err
-	}
-
-	now := time.Now().UnixMilli()
-	res, err := a.db.Exec(`INSERT INTO assets(owner_id, kind, filename, path, mime, size, sha256, device_key, taken_at, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`, u.ID, kind, name, filepath.ToSlash(rel), mime, size, sum, deviceKey, taken.UnixMilli(), now)
-	if err != nil {
-		os.Remove(filepath.Join(a.libDir, rel))
-		return nil, err
-	}
-	id, _ := res.LastInsertId()
-	a.wake()
-
-	asset, err := scanAsset(a.db.QueryRow(`SELECT `+assetCols+` FROM assets a WHERE id=?`, id))
-	return &uploadResult{Status: "created", Asset: asset}, err
+	return id, s, true
 }
 
-func cleanFilename(name string) string {
-	name = filepath.Base(strings.ReplaceAll(name, "\\", "/"))
-	name = strings.Map(func(r rune) rune {
-		if r < 32 || strings.ContainsRune(`/\:*?"<>|`, r) {
-			return '_'
-		}
-		return r
-	}, name)
-	name = strings.TrimLeft(strings.TrimSpace(name), ".")
-	if name == "" {
-		name = "photo"
+func (a *App) handlePutOriginal(w http.ResponseWriter, r *http.Request, u *User) {
+	id, s, ok := a.ownedState(w, r, u)
+	if !ok {
+		return
 	}
-	if len(name) > 180 {
-		ext := filepath.Ext(name)
-		name = name[:180-len(ext)] + ext
+	if s.complete {
+		httpError(w, http.StatusConflict, "déjà envoyé")
+		return
 	}
-	return name
+	offset, err := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
+	if err != nil || offset != s.uploaded {
+		w.Header().Set("X-Uploaded", strconv.FormatInt(s.uploaded, 10))
+		httpError(w, http.StatusConflict, "position incorrecte")
+		return
+	}
+	limit := min(int64(maxPart), s.size-s.uploaded)
+	p := a.blobPath(u.ID, id, "o.part")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		serverError(w, err)
+		return
+	}
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	defer f.Close()
+	// on repart toujours de la position validée : un morceau à moitié écrit est simplement réécrit
+	if err := f.Truncate(offset); err != nil {
+		serverError(w, err)
+		return
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		serverError(w, err)
+		return
+	}
+	n, err := io.Copy(f, io.LimitReader(r.Body, limit+1))
+	if n > limit {
+		f.Truncate(offset)
+		httpError(w, http.StatusRequestEntityTooLarge, "morceau trop grand")
+		return
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if err != nil {
+		f.Truncate(offset)
+		httpError(w, http.StatusBadRequest, "envoi interrompu")
+		return
+	}
+	a.db.Exec(`UPDATE assets SET uploaded=? WHERE id=?`, offset+n, id)
+	writeJSON(w, map[string]any{"uploaded": offset + n})
 }
 
-// uniquePath choisit un nom libre dans le dossier : IMG_1.jpg, IMG_1 (2).jpg, …
-func uniquePath(root, relDir, name string) (string, error) {
-	ext := filepath.Ext(name)
-	base := strings.TrimSuffix(name, ext)
-	for i := 1; i < 10000; i++ {
-		candidate := name
-		if i > 1 {
-			candidate = fmt.Sprintf("%s (%d)%s", base, i, ext)
+func (a *App) putSmallBlob(variant, column string, max int64) userHandler {
+	return func(w http.ResponseWriter, r *http.Request, u *User) {
+		id, _, ok := a.ownedState(w, r, u)
+		if !ok {
+			return
 		}
-		rel := filepath.Join(relDir, candidate)
-		if _, err := os.Lstat(filepath.Join(root, rel)); errors.Is(err, os.ErrNotExist) {
-			return rel, nil
+		data, err := io.ReadAll(io.LimitReader(r.Body, max+1))
+		if err != nil || int64(len(data)) > max || len(data) < NonceSize+TagSize {
+			httpError(w, http.StatusBadRequest, "fichier invalide")
+			return
 		}
+		if err := writeFileAtomic(a.blobPath(u.ID, id, variant), data); err != nil {
+			serverError(w, err)
+			return
+		}
+		a.db.Exec(`UPDATE assets SET `+column+`=1 WHERE id=?`, id)
+		writeJSON(w, map[string]any{"ok": true})
 	}
-	return "", errors.New("impossible de trouver un nom libre pour " + name)
 }
 
-// handleCheck indique quels fichiers du téléphone sont déjà sauvegardés (nom + taille).
+func writeFileAtomic(p string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p)
+}
+
+// --- 3. fin d'envoi ---
+
+func (a *App) handleCompleteAsset(w http.ResponseWriter, r *http.Request, u *User) {
+	id, s, ok := a.ownedState(w, r, u)
+	if !ok {
+		return
+	}
+	if s.complete {
+		writeJSON(w, map[string]any{"ok": true})
+		return
+	}
+	if s.uploaded != s.size {
+		httpError(w, http.StatusConflict, fmt.Sprintf("envoi incomplet (%d / %d octets)", s.uploaded, s.size))
+		return
+	}
+	part, final := a.blobPath(u.ID, id, "o.part"), a.blobPath(u.ID, id, "o")
+	if !hasStreamMagic(part) {
+		httpError(w, http.StatusBadRequest, "fichier chiffré invalide")
+		return
+	}
+	if err := os.Rename(part, final); err != nil {
+		serverError(w, err)
+		return
+	}
+	a.db.Exec(`UPDATE assets SET complete=1 WHERE id=?`, id)
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func hasStreamMagic(p string) bool {
+	f, err := os.Open(p)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	b := make([]byte, 4)
+	_, err = io.ReadFull(f, b)
+	return err == nil && string(b) == string(streamMagic)
+}
+
+// handleCheck : parmi ces empreintes de fichiers du téléphone, lesquelles sont déjà sauvegardées ?
 func (a *App) handleCheck(w http.ResponseWriter, r *http.Request, u *User) {
 	var body struct {
-		Keys []string `json:"keys"`
+		Tags []string `json:"tags"`
 	}
 	if !readJSON(w, r, &body) {
 		return
 	}
 	known := map[string]bool{}
-	rows, err := a.db.Query(`SELECT device_key FROM assets WHERE owner_id=?`, u.ID)
+	rows, err := a.db.Query(`SELECT device_tag FROM assets WHERE owner_id=? AND complete=1 AND device_tag<>''`, u.ID)
 	if err != nil {
 		serverError(w, err)
 		return
@@ -201,7 +276,7 @@ func (a *App) handleCheck(w http.ResponseWriter, r *http.Request, u *User) {
 	}
 	rows.Close()
 	out := []string{}
-	for _, k := range body.Keys {
+	for _, k := range body.Tags {
 		if known[strings.ToLower(k)] {
 			out = append(out, k)
 		}
@@ -209,15 +284,43 @@ func (a *App) handleCheck(w http.ResponseWriter, r *http.Request, u *User) {
 	writeJSON(w, map[string]any{"existing": out})
 }
 
+// handleRewrapKeys : l'import a scellé la clé du fichier pour la clé publique du compte ; le client,
+// qui seul peut l'ouvrir, la rechiffre avec sa clé maître.
+func (a *App) handleRewrapKeys(w http.ResponseWriter, r *http.Request, u *User) {
+	var body struct {
+		Keys []struct {
+			ID int64  `json:"id"`
+			FK []byte `json:"fk"`
+		} `json:"keys"`
+	}
+	if !readJSON(w, r, &body) {
+		return
+	}
+	n := 0
+	for _, k := range body.Keys {
+		if len(k.FK) != boxSize {
+			continue
+		}
+		res, err := a.db.Exec(`UPDATE assets SET wrapped_fk=?, fk_sealed=0 WHERE id=? AND owner_id=? AND fk_sealed=1`, k.FK, k.ID, u.ID)
+		if err == nil {
+			if c, _ := res.RowsAffected(); c > 0 {
+				n++
+				a.writeAssetFiles(k.ID)
+			}
+		}
+	}
+	writeJSON(w, map[string]any{"updated": n})
+}
+
 // --- consultation ---
 
 func (a *App) handleTimeline(w http.ResponseWriter, r *http.Request, u *User) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
-	if limit <= 0 || limit > 1000 {
+	if limit <= 0 || limit > 2000 {
 		limit = 300
 	}
-	where := []string{"a.owner_id = ?"}
+	where := []string{"a.owner_id = ?", "a.complete = 1"}
 	args := []any{u.ID}
 	order := "a.taken_at DESC, a.id DESC"
 	sortCol := "a.taken_at"
@@ -232,14 +335,13 @@ func (a *App) handleTimeline(w http.ResponseWriter, r *http.Request, u *User) {
 	if q.Get("favorites") == "1" {
 		where = append(where, "a.favorite = 1")
 	}
+	if q.Get("sealed") == "1" {
+		where = append(where, "a.fk_sealed = 1")
+	}
 	switch q.Get("kind") {
 	case "video", "image":
 		where = append(where, "a.kind = ?")
 		args = append(args, q.Get("kind"))
-	}
-	if s := strings.TrimSpace(q.Get("q")); s != "" {
-		where = append(where, "a.filename LIKE ? ESCAPE '\\'")
-		args = append(args, "%"+likeEscape(s)+"%")
 	}
 	if y, err := strconv.Atoi(q.Get("year")); err == nil && y > 1800 {
 		from := time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
@@ -274,13 +376,8 @@ func (a *App) handleTimeline(w http.ResponseWriter, r *http.Request, u *User) {
 	writeJSON(w, map[string]any{"items": items, "next": next})
 }
 
-func likeEscape(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return r.Replace(s)
-}
-
 func (a *App) ownedAsset(u *User, id int64) (Asset, error) {
-	return scanAsset(a.db.QueryRow(`SELECT `+assetCols+` FROM assets a WHERE a.id=? AND a.owner_id=?`, id, u.ID))
+	return scanAsset(a.db.QueryRow(`SELECT `+assetCols+` FROM assets a WHERE a.id=? AND a.owner_id=? AND a.complete=1`, id, u.ID))
 }
 
 func (a *App) handleAsset(w http.ResponseWriter, r *http.Request, u *User) {
@@ -294,17 +391,17 @@ func (a *App) handleAsset(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	albums := []map[string]any{}
-	rows, err := a.db.Query(`SELECT al.id, al.name FROM album_assets aa JOIN albums al ON al.id=aa.album_id WHERE aa.asset_id=? ORDER BY al.name`, id)
+	rows, err := a.db.Query(`SELECT al.id, al.name FROM album_assets aa JOIN albums al ON al.id=aa.album_id WHERE aa.asset_id=? AND al.owner_id=?`, id, u.ID)
 	if err == nil {
 		for rows.Next() {
 			var aid int64
-			var name string
+			var name []byte
 			rows.Scan(&aid, &name)
 			albums = append(albums, map[string]any{"id": aid, "name": name})
 		}
 		rows.Close()
 	}
-	writeJSON(w, map[string]any{"asset": as, "albums": albums, "path": as.Path})
+	writeJSON(w, map[string]any{"asset": as, "albums": albums})
 }
 
 func (a *App) serveOwned(variant string) userHandler {
@@ -313,115 +410,32 @@ func (a *App) serveOwned(variant string) userHandler {
 		if !ok {
 			return
 		}
-		as, err := a.ownedAsset(u, id)
-		if err != nil {
+		if _, err := a.ownedAsset(u, id); err != nil {
 			httpError(w, http.StatusNotFound, "introuvable")
 			return
 		}
-		a.serveAsset(w, r, as, variant, true)
+		a.serveBlob(w, r, u.ID, id, variant)
 	}
 }
 
-// serveAsset envoie la miniature ("s"), l'aperçu ("m") ou l'original ("").
-func (a *App) serveAsset(w http.ResponseWriter, r *http.Request, as Asset, variant string, allowDownload bool) {
-	if variant != "" {
-		p := a.thumbPath(as.ID, variant)
-		f, err := os.Open(p)
-		if err != nil {
-			if as.Thumb == 2 {
-				w.Header().Set("Cache-Control", "private, max-age=3600")
-				serveFallbackIcon(w, as.Kind)
-				return
-			}
-			w.Header().Set("Retry-After", "3")
-			httpError(w, http.StatusNotFound, "miniature en préparation")
-			return
-		}
-		defer f.Close()
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.Header().Set("Cache-Control", "private, max-age=2592000")
-		http.ServeContent(w, r, "", time.Time{}, f)
-		return
-	}
-	if !allowDownload {
-		httpError(w, http.StatusForbidden, "téléchargement désactivé")
-		return
-	}
-	f, err := os.Open(filepath.Join(a.libDir, filepath.FromSlash(as.Path)))
+// serveBlob envoie un fichier chiffré tel quel (Range pris en charge : le client déchiffre les blocs demandés).
+func (a *App) serveBlob(w http.ResponseWriter, r *http.Request, owner, id int64, variant string) {
+	f, err := os.Open(a.blobPath(owner, id, variant))
 	if err != nil {
-		httpError(w, http.StatusNotFound, "fichier original introuvable")
+		httpError(w, http.StatusNotFound, "fichier introuvable")
 		return
 	}
 	defer f.Close()
 	st, _ := f.Stat()
-	w.Header().Set("Content-Type", as.Mime)
-	w.Header().Set("Cache-Control", "private, max-age=86400")
-	if r.URL.Query().Get("download") == "1" {
-		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(as.Filename))
+	if variant == "o" {
+		// une longue vidéo regardée d'un bout à l'autre dépasse le délai d'écriture du serveur : délai
+		// proportionnel à la taille (≈ 32 Kio/s au moins), plafonné à 6 h. Pas plus : les liens de partage
+		// publics passent aussi par ici, des connexions lentes ne doivent pas occuper la petite VM indéfiniment.
+		http.NewResponseController(w).SetWriteDeadline(time.Now().Add(blobWriteTimeout(st.Size())))
 	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "private, max-age=2592000")
 	http.ServeContent(w, r, "", st.ModTime(), f)
-}
-
-func serveFallbackIcon(w http.ResponseWriter, kind string) {
-	icon := `<path d="M4 16l4-4 3 3 5-5 4 4" stroke="#9a948c" stroke-width="1.5" fill="none"/><circle cx="8.5" cy="7.5" r="1.5" fill="#9a948c"/>`
-	if kind == "video" {
-		icon = `<path d="M9 7.5v9l7.5-4.5z" fill="#9a948c"/>`
-	}
-	w.Header().Set("Content-Type", "image/svg+xml")
-	fmt.Fprintf(w, `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" fill="#3a3632"/>%s</svg>`, icon)
-}
-
-// --- téléchargement d'une sélection en ZIP ---
-
-func (a *App) handleDownloadSelection(w http.ResponseWriter, r *http.Request, u *User) {
-	var ids []int64
-	for _, s := range strings.Split(r.URL.Query().Get("ids"), ",") {
-		if id, err := strconv.ParseInt(s, 10, 64); err == nil {
-			ids = append(ids, id)
-		}
-	}
-	if len(ids) == 0 || len(ids) > 20000 {
-		httpError(w, http.StatusBadRequest, "sélection invalide")
-		return
-	}
-	ph, args := placeholders(ids)
-	items, err := queryAssets(a.db, `SELECT `+assetCols+` FROM assets a WHERE a.owner_id=? AND a.id IN (`+ph+`) ORDER BY a.taken_at`, append([]any{u.ID}, args...)...)
-	if err != nil {
-		serverError(w, err)
-		return
-	}
-	a.writeZip(w, "pellicule-"+time.Now().Format("2006-01-02"), items)
-}
-
-func (a *App) writeZip(w http.ResponseWriter, name string, items []Asset) {
-	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(name+".zip"))
-	zw := zip.NewWriter(w)
-	used := map[string]int{}
-	for _, as := range items {
-		f, err := os.Open(filepath.Join(a.libDir, filepath.FromSlash(as.Path)))
-		if err != nil {
-			continue
-		}
-		n := as.Filename
-		if c := used[strings.ToLower(n)]; c > 0 {
-			ext := filepath.Ext(n)
-			n = fmt.Sprintf("%s (%d)%s", strings.TrimSuffix(n, ext), c+1, ext)
-		}
-		used[strings.ToLower(as.Filename)]++
-		// photos et vidéos sont déjà compressées : on les stocke tels quels (rapide, peu de CPU)
-		hdr := &zip.FileHeader{Name: n, Method: zip.Store, Modified: time.UnixMilli(as.TakenAt).UTC()}
-		dst, err := zw.CreateHeader(hdr)
-		if err == nil {
-			_, err = io.Copy(dst, f)
-		}
-		f.Close()
-		if err != nil {
-			log.Printf("zip interrompu : %v", err)
-			return
-		}
-	}
-	zw.Close()
 }
 
 // --- actions ---
@@ -431,15 +445,15 @@ func (a *App) handleFavorite(w http.ResponseWriter, r *http.Request, u *User) {
 		IDs      []int64 `json:"ids"`
 		Favorite bool    `json:"favorite"`
 	}
-	if !readJSON(w, r, &body) || len(body.IDs) == 0 {
+	if !readJSON(w, r, &body) || len(body.IDs) == 0 || len(body.IDs) > 20000 {
 		return
 	}
 	ph, args := placeholders(body.IDs)
-	_, err := a.db.Exec(`UPDATE assets SET favorite=? WHERE owner_id=? AND id IN (`+ph+`)`, append([]any{body.Favorite, u.ID}, args...)...)
-	if err != nil {
+	if _, err := a.db.Exec(`UPDATE assets SET favorite=? WHERE owner_id=? AND id IN (`+ph+`)`, append([]any{body.Favorite, u.ID}, args...)...); err != nil {
 		serverError(w, err)
 		return
 	}
+	a.writeAssetFiles(body.IDs...)
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -449,12 +463,12 @@ func (a *App) handleTrash(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	ph, args := placeholders(ids)
-	_, err := a.db.Exec(`UPDATE assets SET trashed_at=? WHERE owner_id=? AND trashed_at IS NULL AND id IN (`+ph+`)`,
-		append([]any{time.Now().UnixMilli(), u.ID}, args...)...)
-	if err != nil {
+	if _, err := a.db.Exec(`UPDATE assets SET trashed_at=? WHERE owner_id=? AND trashed_at IS NULL AND id IN (`+ph+`)`,
+		append([]any{time.Now().UnixMilli(), u.ID}, args...)...); err != nil {
 		serverError(w, err)
 		return
 	}
+	a.writeAssetFiles(ids...)
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -464,12 +478,47 @@ func (a *App) handleRestore(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	ph, args := placeholders(ids)
-	_, err := a.db.Exec(`UPDATE assets SET trashed_at=NULL WHERE owner_id=? AND id IN (`+ph+`)`, append([]any{u.ID}, args...)...)
-	if err != nil {
+	if _, err := a.db.Exec(`UPDATE assets SET trashed_at=NULL WHERE owner_id=? AND id IN (`+ph+`)`, append([]any{u.ID}, args...)...); err != nil {
 		serverError(w, err)
 		return
 	}
+	a.writeAssetFiles(ids...)
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+type purgeItem struct{ owner, id int64 }
+
+func (a *App) purgeWhere(where string, args ...any) int {
+	rows, err := a.db.Query(`SELECT owner_id, id FROM assets WHERE `+where, args...)
+	if err != nil {
+		log.Printf("suppression : %v", err)
+		return 0
+	}
+	var items []purgeItem
+	for rows.Next() {
+		var p purgeItem
+		rows.Scan(&p.owner, &p.id)
+		items = append(items, p)
+	}
+	rows.Close()
+	a.purge(items)
+	return len(items)
+}
+
+// purge supprime définitivement fichiers et entrées.
+func (a *App) purge(items []purgeItem) {
+	for _, p := range items {
+		failed := false
+		for _, v := range []string{"o", "o.part", "m", "s", "k"} {
+			if err := os.Remove(a.blobPath(p.owner, p.id, v)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.Printf("suppression de #%d.%s : %v", p.id, v, err)
+				failed = true
+			}
+		}
+		if !failed {
+			a.db.Exec(`DELETE FROM assets WHERE id=?`, p.id)
+		}
+	}
 }
 
 func (a *App) handleDeleteForever(w http.ResponseWriter, r *http.Request, u *User) {
@@ -478,50 +527,27 @@ func (a *App) handleDeleteForever(w http.ResponseWriter, r *http.Request, u *Use
 		return
 	}
 	ph, args := placeholders(ids)
-	items, err := queryAssets(a.db, `SELECT `+assetCols+` FROM assets a WHERE a.owner_id=? AND a.trashed_at IS NOT NULL AND a.id IN (`+ph+`)`, append([]any{u.ID}, args...)...)
-	if err != nil {
-		serverError(w, err)
-		return
-	}
-	a.purge(items)
-	writeJSON(w, map[string]any{"ok": true, "deleted": len(items)})
+	n := a.purgeWhere(`owner_id=? AND trashed_at IS NOT NULL AND id IN (`+ph+`)`, append([]any{u.ID}, args...)...)
+	writeJSON(w, map[string]any{"ok": true, "deleted": n})
 }
 
 func (a *App) handleEmptyTrash(w http.ResponseWriter, r *http.Request, u *User) {
-	items, err := queryAssets(a.db, `SELECT `+assetCols+` FROM assets a WHERE a.owner_id=? AND a.trashed_at IS NOT NULL`, u.ID)
-	if err != nil {
-		serverError(w, err)
-		return
-	}
-	a.purge(items)
-	writeJSON(w, map[string]any{"ok": true, "deleted": len(items)})
-}
-
-// purge supprime définitivement fichiers, miniatures et entrées.
-func (a *App) purge(items []Asset) {
-	for _, as := range items {
-		if err := os.Remove(filepath.Join(a.libDir, filepath.FromSlash(as.Path))); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Printf("suppression de %s : %v", as.Path, err)
-			continue
-		}
-		os.Remove(a.thumbPath(as.ID, "s"))
-		os.Remove(a.thumbPath(as.ID, "m"))
-		a.db.Exec(`DELETE FROM assets WHERE id=?`, as.ID)
-	}
+	n := a.purgeWhere(`owner_id=? AND trashed_at IS NOT NULL`, u.ID)
+	writeJSON(w, map[string]any{"ok": true, "deleted": n})
 }
 
 func (a *App) handleStats(w http.ResponseWriter, r *http.Request, u *User) {
-	var photos, videos, bytes, pending, trash int64
+	var photos, videos, bytes, trash, sealed int64
 	a.db.QueryRow(`SELECT
 		COALESCE(SUM(kind='image' AND trashed_at IS NULL),0),
 		COALESCE(SUM(kind='video' AND trashed_at IS NULL),0),
-		COALESCE(SUM(size),0),
-		COALESCE(SUM(thumb_status=0),0),
-		COALESCE(SUM(trashed_at IS NOT NULL),0)
-		FROM assets WHERE owner_id=?`, u.ID).Scan(&photos, &videos, &bytes, &pending, &trash)
+		COALESCE(SUM(orig_size),0),
+		COALESCE(SUM(trashed_at IS NOT NULL),0),
+		COALESCE(SUM(fk_sealed),0)
+		FROM assets WHERE owner_id=? AND complete=1`, u.ID).Scan(&photos, &videos, &bytes, &trash, &sealed)
 	years := []int{}
 	rows, err := a.db.Query(`SELECT DISTINCT CAST(strftime('%Y', taken_at/1000, 'unixepoch') AS INTEGER) y FROM assets
-		WHERE owner_id=? AND trashed_at IS NULL ORDER BY y DESC`, u.ID)
+		WHERE owner_id=? AND complete=1 AND trashed_at IS NULL ORDER BY y DESC`, u.ID)
 	if err == nil {
 		for rows.Next() {
 			var y int
@@ -530,9 +556,21 @@ func (a *App) handleStats(w http.ResponseWriter, r *http.Request, u *User) {
 		}
 		rows.Close()
 	}
-	free := diskFree(a.libDir)
 	writeJSON(w, map[string]any{
-		"photos": photos, "videos": videos, "bytes": bytes, "pending": pending, "trash": trash,
-		"years": years, "diskFree": free, "tools": a.tools.summary(), "import": a.importStatus(u),
+		"photos": photos, "videos": videos, "bytes": bytes, "trash": trash, "sealed": sealed,
+		"years": years, "diskFree": diskFree(a.libDir), "import": a.importStatus(u),
+		"files": adminOnly(u, a.filesStatus()),
 	})
+}
+
+// adminOnly : information réservée à l'administrateur (nil pour les autres comptes).
+func adminOnly(u *User, v any) any {
+	if !u.IsAdmin {
+		return nil
+	}
+	return v
+}
+
+func blobWriteTimeout(size int64) time.Duration {
+	return min(10*time.Minute+time.Duration(size/(32<<10))*time.Second, 6*time.Hour)
 }

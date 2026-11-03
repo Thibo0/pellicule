@@ -112,6 +112,7 @@ function toast(msg, { action, timeout = 4500 } = {}) {
   if (action) el.querySelector('button').onclick = () => { close(); action.run(); };
   $('#toasts').appendChild(el);
   setTimeout(close, timeout);
+  return { close, set: m => { el.firstChild.textContent = m; } };
 }
 
 function modal(html, setup) {
@@ -186,9 +187,23 @@ class Gallery {
     this.bind();
     this.io = new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) this.load(); }, { rootMargin: '1500px 0px' });
     this.io.observe(this.moreEl);
+    // miniatures : téléchargées et déchiffrées seulement à l'approche de l'écran
+    this.thumbIO = new IntersectionObserver(es => es.forEach(e => {
+      if (!e.isIntersecting) return;
+      this.thumbIO.unobserve(e.target);
+      this.paint(e.target);
+    }), { rootMargin: '800px 0px' });
   }
 
-  thumb(a) { return this.o.thumbUrl ? this.o.thumbUrl(a) : `/api/assets/${a.id}/thumb`; }
+  paint(tile) {
+    const a = this.items[+tile.dataset.i];
+    const img = tile.querySelector('img');
+    if (!a || !img) return;
+    Vault.imageURL(a, 'thumb').then(u => {
+      if (u) img.src = u;
+      else { tile.querySelector('.pending')?.remove(); tile.classList.add('noimg'); }
+    }).catch(() => tile.classList.add('noimg'));
+  }
 
   load() {
     if (this.loading) return this.loading;
@@ -199,6 +214,7 @@ class Gallery {
         const r = await this.o.load(this.next);
         this.next = r.next;
         this.done = !r.next;
+        await Vault.hydrate(r.items, this.o.src || { owner: true });
         this.append(r.items);
       } catch (e) {
         if (e.message !== 'non connecté') toast(e.message);
@@ -215,9 +231,9 @@ class Gallery {
   }
 
   tile(a, i) {
-    const pending = a.thumb === 0 ? '<div class="pending"><div class="spinner"></div></div>' : '';
-    return `<div class="tile${this.sel.has(a.id) ? ' sel' : ''}" data-i="${i}" tabindex="0" role="button" aria-label="${esc(a.filename)}">${pending}
-      <img src="${this.thumb(a)}" alt="" loading="lazy" decoding="async" draggable="false">
+    const ph = a.thumb && !a.broken ? '' : `<div class="ph">${icon(a.kind === 'video' ? 'video' : 'file')}<small>${esc(a.filename)}</small></div>`;
+    return `<div class="tile${this.sel.has(a.id) ? ' sel' : ''}" data-i="${i}" tabindex="0" role="button" aria-label="${esc(a.filename)}">${ph}
+      <img alt="" decoding="async" draggable="false">
       <div class="shade"></div>
       ${this.o.selectable ? `<div class="check">${icon('check')}</div>` : ''}
       ${a.kind === 'video' ? `<div class="badge b-tr">${a.duration ? fmtDuration(a.duration) : ''}${icon('play', 'fill')}</div>` : ''}
@@ -246,6 +262,10 @@ class Gallery {
       buf.set(g, (buf.get(g) || '') + this.tile(a, i));
     });
     for (const [g, html] of buf) g.grid.insertAdjacentHTML('beforeend', html);
+    this.observeTiles(start);
+  }
+  observeTiles(from = 0) {
+    this.root.querySelectorAll('.tile').forEach(t => { if (+t.dataset.i >= from) this.thumbIO.observe(t); });
   }
 
   bind() {
@@ -253,17 +273,6 @@ class Gallery {
     r.addEventListener('load', e => {
       if (e.target.tagName !== 'IMG') return;
       e.target.classList.add('ok');
-      e.target.parentNode.querySelector('.pending')?.remove();
-    }, true);
-    // miniature pas encore prête : on réessaie tant que le serveur la prépare
-    r.addEventListener('error', e => {
-      const img = e.target;
-      if (img.tagName !== 'IMG') return;
-      const n = +(img.dataset.retry || 0);
-      if (n < 60) {
-        img.dataset.retry = n + 1;
-        setTimeout(() => { if (img.isConnected) img.src = img.src.split('?')[0] + '?r=' + n; }, 3000);
-      }
     }, true);
     r.addEventListener('click', e => {
       const day = e.target.closest('.sel-day');
@@ -352,9 +361,11 @@ class Gallery {
     if (i < 0) return;
     this.items[i] = a;
     const el = this.root.querySelector(`.tile[data-i="${i}"]`);
-    if (el) el.outerHTML = this.tile(a, i);
+    if (!el) return;
+    el.outerHTML = this.tile(a, i);
+    this.paint(this.root.querySelector(`.tile[data-i="${i}"]`));
   }
-  destroy() { this.io.disconnect(); }
+  destroy() { this.io.disconnect(); this.thumbIO.disconnect(); }
 }
 
 /* ---------- barre de sélection ---------- */
@@ -402,32 +413,54 @@ async function trashItems(items, g) {
   });
 }
 
-function downloadItems(items) {
-  // dans l'app Android : chaque original va dans la galerie du téléphone (pas de ZIP)
+// Les originaux sont déchiffrés ici, dans la page (le serveur ne renvoie que du chiffré).
+async function downloadItems(items, zipName = 'Pellicule') {
+  items = items.filter(a => !a.broken);
+  if (!items.length) return toast('Rien à télécharger');
+  // dans l'app Android : l'app déchiffre elle-même et range chaque original dans la galerie du téléphone
   if (NATIVE?.download) {
-    return NATIVE.download(JSON.stringify(items.map(a => ({ url: `${location.origin}/api/assets/${a.id}/original?download=1`, name: a.filename }))));
+    return NATIVE.download(JSON.stringify(items.map(a => ({
+      url: `${location.origin}/api/${a.src?.share ? `s/${a.src.share.token}/` : ''}assets/${a.id}/original`,
+      fk: PC.toB64(a.fkRaw), name: a.filename, mime: a.mime,
+    }))));
   }
-  if (items.length === 1) return downloadUrl(`/api/assets/${items[0].id}/original?download=1`);
-  downloadUrl('/api/download?ids=' + items.map(a => a.id).join(','));
+  const t = toast(items.length > 1 ? `Préparation de ${countLabel(items.length)}…` : 'Téléchargement…', { timeout: 6e5 });
+  try {
+    await Vault.download(items, zipName, (d, total) => t.set(`${items.length > 1 ? 'ZIP' : 'Téléchargement'} : ${Math.round(d / total * 100)} %`));
+  } finally { t.close(); }
 }
-function downloadUrl(url) {
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = '';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+
+// couvertures d'albums : clé de la photo de couverture, ouverte comme celle d'une photo normale
+function albumCover(al, imgClass = '') {
+  if (!al.coverId || !al.coverFk) return icon('album');
+  return `<img class="${imgClass}" data-cover="${al.coverId}" alt="">`;
+}
+async function paintCovers(root, albums) {
+  const by = new Map(albums.map(al => [String(al.coverId), al]));
+  for (const img of root.querySelectorAll('img[data-cover]')) {
+    const al = by.get(img.dataset.cover);
+    if (!al) continue;
+    const [a] = await Vault.hydrate([{ id: al.coverId, fk: al.coverFk, sealed: al.coverSealed, meta: al.coverMeta, thumb: true }], { owner: true });
+    Vault.imageURL(a, 'thumb').then(u => { if (u) img.src = u; }).catch(() => {});
+  }
+}
+
+// ajout dans un album : si l'album est partagé, chaque lien reçoit les clés des nouvelles photos
+async function addToAlbum(albumId, items) {
+  await post(`/api/albums/${albumId}/add`, { ids: items.map(a => a.id) });
+  await Vault.syncShares(albumId, items);
 }
 
 async function albumPicker(items, exceptId) {
   const ids = items.map(a => a.id);
-  const albums = (await api('/api/albums')).filter(al => al.id !== exceptId);
+  const albums = await Promise.all((await api('/api/albums')).filter(al => al.id !== exceptId).map(Vault.hydrateAlbum));
   const choice = await modal(`<h2>Ajouter à un album</h2><p>${countLabel(ids.length)}</p><div class="list">
       <button data-new><span class="th">${icon('plus')}</span><div><b>Nouvel album</b></div></button>
-      ${albums.map(al => `<button data-id="${al.id}"><span class="th">${al.coverId ? `<img src="/api/assets/${al.coverId}/thumb" alt="">` : icon('album')}</span>
+      ${albums.map(al => `<button data-id="${al.id}"><span class="th">${albumCover(al)}</span>
         <div><b>${esc(al.name)}</b><small>${countLabel(al.count)}</small></div></button>`).join('')}
     </div><div class="foot"><button class="btn" data-close>Annuler</button></div>`,
   (m, close) => {
+    paintCovers(m, albums);
     m.onclick = e => {
       const b = e.target.closest('button');
       if (!b) return;
@@ -439,10 +472,10 @@ async function albumPicker(items, exceptId) {
   if (choice === 'new') {
     const name = await promptModal('Nouvel album', { label: 'Nom', placeholder: 'Vacances d’été', ok: 'Créer' });
     if (!name) return false;
-    const r = await post('/api/albums', { name, ids });
+    const r = await post('/api/albums', { name: await Vault.sealName(name), ids });
     toast(`Ajouté à « ${name} »`, { action: { label: 'Voir', run: () => { location.hash = '#/albums/' + r.id; } } });
   } else {
-    await post(`/api/albums/${choice}/add`, { ids });
+    await addToAlbum(choice, items);
     const al = albums.find(x => x.id === choice);
     toast(`Ajouté à « ${al.name} »`, { action: { label: 'Voir', run: () => { location.hash = '#/albums/' + choice; } } });
   }
@@ -454,9 +487,8 @@ async function albumPicker(items, exceptId) {
    ========================================================= */
 function openViewer(g, index, opts = {}) {
   const share = opts.share;
-  const base = share ? `/api/s/${share.token}/assets/` : '/api/assets/';
-  const preview = a => `${base}${a.id}/preview`;
-  const original = a => `${base}${a.id}/original`;
+  // aperçu déchiffré ; à défaut (vieux téléphone, format exotique) la miniature
+  const preview = async a => (await Vault.imageURL(a, 'preview')) || Vault.imageURL(a, 'thumb');
   const canDownload = !share || share.allowDownload;
   let i = index, chrome = true, closed = false;
   let infoOpen = false;
@@ -519,28 +551,40 @@ function openViewer(g, index, opts = {}) {
       </div>
       ${i > 0 ? `<button class="icon-btn nav prev" data-a="prev" title="Précédente">${icon('left')}</button>` : ''}
       ${hasNext ? `<button class="icon-btn nav next" data-a="next" title="Suivante">${icon('right')}</button>` : ''}
+      <div class="loading"><div class="spinner"></div></div>
       ${a.kind === 'video'
-        ? `<video src="${original(a)}" poster="${preview(a)}" controls playsinline autoplay preload="metadata"></video>`
-        : `<div class="loading"><div class="spinner"></div></div><img src="${preview(a)}" alt="${esc(a.filename)}" draggable="false">`}
+        ? '<video controls playsinline autoplay preload="metadata"></video>'
+        : `<img alt="${esc(a.filename)}" draggable="false">`}
     </div>${infoOpen ? `<aside class="info"><h3><span class="grow">Informations</span><button class="icon-btn" data-a="info">${icon('x')}</button></h3><div id="info-body"></div></aside>` : ''}`;
     el.classList.toggle('chrome-off', !chrome);
 
+    const done = () => el.querySelector('.loading')?.remove();
+    const fail = msg => { done(); el.querySelector('.stage').insertAdjacentHTML('beforeend', `<div class="vmsg">${icon('info')}<p>${esc(msg)}</p></div>`); };
+    const shown = i;
+    if (a.broken) fail('Ce fichier ne peut pas être déchiffré.');
     const img = el.querySelector('.stage img');
-    if (img) {
-      const done = () => el.querySelector('.loading')?.remove();
-      if (img.complete) done();
+    if (img && !a.broken) {
       img.onload = done;
-      img.onerror = () => {
-        done();
-        if (a.thumb !== 1) setTimeout(() => { if (img.isConnected) img.src = preview(a) + '?r=' + Date.now(); }, 3000);
-      };
       setupZoom(img);
+      preview(a).then(u => {
+        if (shown !== i) return;
+        if (u) img.src = u;
+        else fail('Pas d’aperçu pour ce format. Télécharge l’original pour l’ouvrir.');
+      }).catch(e => shown === i && fail(e.message));
+    }
+    const video = el.querySelector('.stage video');
+    if (video && !a.broken) {
+      video.onloadeddata = done;
+      video.onerror = () => fail('Lecture impossible dans ce navigateur. Télécharge la vidéo pour la lire.');
+      preview(a).then(u => { if (u && shown === i) video.poster = u; }).catch(() => {});
+      Vault.rememberVideo(a);
+      Vault.videoURL(a).then(u => { if (shown === i) video.src = u; }).catch(e => shown === i && fail(e.message));
     }
     if (infoOpen) fillInfo(a);
     // précharge les voisines
     for (const k of [i + 1, i - 1]) {
       const n = g.items[k];
-      if (n && n.kind === 'image') new Image().src = preview(n);
+      if (n && n.kind === 'image') preview(n).catch(() => {});
     }
   }
 
@@ -549,17 +593,15 @@ function openViewer(g, index, opts = {}) {
     const rows = [
       [icon('calendar'), cap(DF.full.format(a.takenAt)), DF.time.format(a.takenAt)],
       [icon(a.kind === 'video' ? 'video' : 'file'), a.filename,
-        [a.width ? `${a.width} × ${a.height}` : '', fmtSize(a.size), a.kind === 'video' && a.duration ? fmtDuration(a.duration) : ''].filter(Boolean).join(' · ')],
+        [a.width ? `${a.width} × ${a.height}` : '', fmtSize(a.plainSize), a.kind === 'video' && a.duration ? fmtDuration(a.duration) : ''].filter(Boolean).join(' · ')],
     ];
     box.innerHTML = rows.map(([ic, t, s]) => `<div class="row">${ic}<div>${esc(t)}<small>${esc(s)}</small></div></div>`).join('');
     if (share) return;
     try {
       const d = await api(`/api/assets/${a.id}`);
-      if (!box.isConnected) return;
-      box.insertAdjacentHTML('beforeend', `<div class="row">${icon('folder')}<div><small>${esc(d.path)}</small></div></div>`);
-      if (d.albums.length) {
-        box.insertAdjacentHTML('beforeend', `<div class="row">${icon('album')}<div>${d.albums.map(al => `<a class="pill" href="#/albums/${al.id}" data-a="goto">${esc(al.name)}</a>`).join('')}</div></div>`);
-      }
+      if (!box.isConnected || !d.albums.length) return;
+      const names = await Promise.all(d.albums.map(al => Vault.openName(al.name)));
+      box.insertAdjacentHTML('beforeend', `<div class="row">${icon('album')}<div>${d.albums.map((al, k) => `<a class="pill" href="#/albums/${al.id}" data-a="goto">${esc(names[k])}</a>`).join('')}</div></div>`);
     } catch { /* infos facultatives */ }
   }
 
@@ -603,7 +645,7 @@ function openViewer(g, index, opts = {}) {
         g.update(a);
         return render();
       case 'album': return albumPicker([a], opts.album);
-      case 'dl': return share ? downloadUrl(original(a) + '?download=1') : downloadItems([a]);
+      case 'dl': return downloadItems([a]);
       case 'cover':
         await api(`/api/albums/${opts.album}`, { method: 'PATCH', body: { coverId: a.id } });
         return toast('Couverture de l’album modifiée');
@@ -717,39 +759,33 @@ const uploader = {
     while (this.active < 2 && this.q.length) this.send(this.q.shift());
     if (!this.active && !this.q.length) this.finish();
   },
-  send(f) {
+  // chaque fichier est chiffré ici, par blocs, avant de partir ; un envoi coupé reprend où il en était
+  async send(f) {
     this.active++;
     this.current = f.name;
-    const fd = new FormData();
-    fd.append('mtime', String(f.lastModified || 0));
-    fd.append('file', f, f.name);
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/upload');
-    xhr.setRequestHeader('X-Pellicule', '1');
-    let sent = 0;
-    xhr.upload.onprogress = e => { this.bytesDone += e.loaded - sent; sent = e.loaded; this.render(); };
-    const end = () => {
-      this.active--;
-      let res = null;
-      try { res = JSON.parse(xhr.responseText); } catch { /* réponse vide */ }
-      if (xhr.status === 0 && !f.retried) {
-        // coupure réseau : on retente une fois
-        f.retried = true;
-        this.bytesDone -= sent;
-        this.q.push(f);
-      } else {
-        this.bytesDone += f.size - sent;
-        this.done++;
-        if (xhr.status === 200 && res) res.status === 'created' ? this.created++ : this.dup++;
-        else if (xhr.status === 401) { this.errors.push('Session expirée : reconnecte-toi.'); this.q = []; }
-        else this.errors.push(`${f.name} : ${res?.error || 'échec de l’envoi'}`);
-      }
-      this.render();
-      this.pump();
-    };
-    xhr.onload = end;
-    xhr.onerror = end;
-    xhr.send(fd);
+    let sent = 0, retry = false;
+    const onBytes = n => { sent += n; this.bytesDone += n; this.render(); };
+    try {
+      const st = await Vault.uploadFile(f, onBytes);
+      st === 'created' ? this.created++ : this.dup++;
+    } catch (e) {
+      if (e.status === 401) { this.errors.push('Session expirée : reconnecte-toi.'); this.q = []; }
+      else if (e.message === 'Serveur injoignable' && (f.retries || 0) < 3) retry = true;
+      else this.errors.push(`${f.name} : ${e.message || 'échec de l’envoi'}`);
+    }
+    if (retry) {
+      // coupure réseau : on reprend un peu plus tard, depuis le dernier morceau reçu par le serveur
+      f.retries = (f.retries || 0) + 1;
+      this.bytesDone -= sent;
+      await new Promise(r => setTimeout(r, 3000 * f.retries));
+      this.q.push(f);
+    } else {
+      this.bytesDone += Math.max(0, f.size - sent);
+      this.done++;
+    }
+    this.active--;
+    this.render();
+    this.pump();
   },
   finish() {
     this.current = '';
@@ -792,17 +828,14 @@ async function importFiles(files) {
     if (files.length) toast('Aucune photo ou vidéo reconnue');
     return;
   }
-  const key = f => `${f.name}|${f.size}`;
-  const existing = new Set();
+  // empreintes HMAC (nom + taille) : le serveur ne voit pas les noms de fichiers
+  let existing = new Set();
   try {
-    for (let k = 0; k < media.length; k += 2000) {
-      const r = await post('/api/assets/check', { keys: media.slice(k, k + 2000).map(key) });
-      r.existing.forEach(x => existing.add(x));
-    }
+    existing = new Set(await Vault.existingTags(media));
   } catch (e) {
-    if (e.message === 'non connecté') return;
+    if (e.status === 401) return boot();
   }
-  const todo = media.filter(f => !existing.has(key(f)));
+  const todo = media.filter(f => !existing.has(f));
   const parts = [];
   if (existing.size) parts.push(`${existing.size} déjà sauvegardé${existing.size > 1 ? 's' : ''}`);
   if (ignored) parts.push(`${ignored} fichier${ignored > 1 ? 's' : ''} ignoré${ignored > 1 ? 's' : ''}`);
@@ -882,15 +915,12 @@ function setActive(key) {
   document.querySelectorAll('[data-nav]').forEach(a => a.classList.toggle('active', a.dataset.nav === key));
 }
 
-let usageTimer = null;
 async function refreshUsage() {
-  clearTimeout(usageTimer);
   try {
     const s = await api('/api/stats');
     const el = $('#usage');
     if (!el) return;
-    el.innerHTML = `<b>${s.photos.toLocaleString('fr-FR')}</b> photos · <b>${s.videos.toLocaleString('fr-FR')}</b> vidéos<br>${fmtSize(s.bytes)} utilisés${s.diskFree >= 0 ? ` · ${fmtSize(s.diskFree)} libres` : ''}${s.pending ? `<br>Préparation de ${s.pending} miniature${s.pending > 1 ? 's' : ''}…` : ''}`;
-    if (s.pending) usageTimer = setTimeout(refreshUsage, 8000);
+    el.innerHTML = `<b>${s.photos.toLocaleString('fr-FR')}</b> photos · <b>${s.videos.toLocaleString('fr-FR')}</b> vidéos<br>${fmtSize(s.bytes)} utilisés${s.diskFree >= 0 ? ` · ${fmtSize(s.diskFree)} libres` : ''}`;
   } catch { /* hors ligne */ }
 }
 
@@ -961,7 +991,7 @@ async function viewPhotos(p, stale) {
   const pick = +p.pick || 0;
   let pickAlbum = null;
   if (pick) {
-    pickAlbum = (await api('/api/albums/' + pick)).album;
+    pickAlbum = await Vault.hydrateAlbum((await api('/api/albums/' + pick)).album);
     if (stale()) return;
   }
   const titles = { photos: 'Photos', favorites: 'Favoris', videos: 'Vidéos', trash: 'Corbeille', search: `« ${p.q} »` };
@@ -975,8 +1005,23 @@ async function viewPhotos(p, stale) {
   if (p.trash) qs.set('trash', '1');
   if (p.favorites) qs.set('favorites', '1');
   if (p.kind) qs.set('kind', p.kind);
-  if (p.q) qs.set('q', p.q);
   if (p.year) qs.set('year', p.year);
+
+  // Recherche : les noms de fichiers sont chiffrés, le serveur ne peut pas chercher. On parcourt la
+  // photothèque par pages de 2000 et on filtre ici, après déchiffrement.
+  const needle = (p.q || '').toLowerCase();
+  const load = mode !== 'search'
+    ? cursor => api('/api/timeline?' + qs + (cursor ? '&cursor=' + cursor : ''))
+    : async cursor => {
+      let next = cursor, found = [];
+      do {
+        const r = await api('/api/timeline?limit=2000' + (next ? '&cursor=' + next : ''));
+        await Vault.hydrate(r.items, { owner: true });
+        found = found.concat(r.items.filter(a => a.filename.toLowerCase().includes(needle)));
+        next = r.next;
+      } while (next && found.length < 60 && !stale());
+      return { items: found, next };
+    };
 
   const empties = {
     photos: emptyState('photos', 'Aucune photo pour l’instant', 'Importe tes premières photos depuis ton téléphone ou ton ordinateur.', '<a class="btn primary" href="#/backup">Sauvegarder mes photos</a>'),
@@ -991,7 +1036,7 @@ async function viewPhotos(p, stale) {
     pickMode: !!pick,
     groupBy: mode === 'trash' ? null : a => dKey(a.takenAt),
     groupLabel: a => dayLabel(a.takenAt),
-    load: cursor => api('/api/timeline?' + qs + (cursor ? '&cursor=' + cursor : '')),
+    load,
     empty: empties[mode],
     open: i => openViewer(g, i),
     onCancel: () => { location.hash = '#/albums/' + pick; },
@@ -1001,7 +1046,7 @@ async function viewPhotos(p, stale) {
   let actions;
   if (pick) {
     actions = [{ label: 'Ajouter', run: async items => {
-      await post(`/api/albums/${pick}/add`, { ids: items.map(a => a.id) });
+      await addToAlbum(pick, items);
       toast(`${countLabel(items.length)} ajouté${items.length > 1 ? 's' : ''}`);
       location.hash = '#/albums/' + pick;
     } }];
@@ -1080,7 +1125,7 @@ async function viewAlbums(stale) {
     <div class="actions"><button class="btn primary" id="new-album">${icon('plus')}Nouvel album</button></div></div>
     <div class="albums" id="albums"><div class="spinner"></div></div>`;
   $('#new-album').onclick = newAlbum;
-  const albums = await api('/api/albums');
+  const albums = await Promise.all((await api('/api/albums')).map(Vault.hydrateAlbum));
   if (stale()) return;
   $('#sub').textContent = plural(albums.length, 'album', 'albums');
   if (!albums.length) {
@@ -1090,17 +1135,18 @@ async function viewAlbums(stale) {
   }
   $('#albums').innerHTML = `<a class="album-card new" href="#" id="new-card"><div class="cover">${icon('plus')}</div><div class="name">Nouvel album</div><div class="meta">&nbsp;</div></a>`
     + albums.map(al => `<a class="album-card" href="#/albums/${al.id}">
-      <div class="cover">${al.coverId ? `<img src="/api/assets/${al.coverId}/thumb" alt="" loading="lazy">` : icon('album')}
+      <div class="cover">${albumCover(al)}
         ${al.shared ? `<span class="shared" title="Partagé par lien">${icon('link')}</span>` : ''}</div>
       <div class="name">${esc(al.name)}</div>
       <div class="meta">${[countLabel(al.count), fmtRange(al.startAt, al.endAt)].filter(Boolean).join(' · ')}</div></a>`).join('');
   $('#new-card').onclick = e => { e.preventDefault(); newAlbum(); };
+  paintCovers($('#albums'), albums);
 }
 
 async function newAlbum() {
   const name = await promptModal('Nouvel album', { label: 'Nom', placeholder: 'Vacances d’été', ok: 'Créer' });
   if (!name) return;
-  const r = await post('/api/albums', { name });
+  const r = await post('/api/albums', { name: await Vault.sealName(name) });
   location.hash = `#/?pick=${r.id}`;
 }
 
@@ -1109,7 +1155,9 @@ async function viewAlbum(id, stale) {
   setActive('albums');
   const r = await api('/api/albums/' + id);
   if (stale()) return;
-  const al = r.album;
+  const al = await Vault.hydrateAlbum(r.album);
+  await Vault.hydrate(r.items, { owner: true });
+  if (stale()) return;
   const v = view();
   v.innerHTML = `<a class="back" href="#/albums">${icon('left')}Albums</a>
     <div class="page-head"><div style="flex:1;min-width:240px">
@@ -1127,12 +1175,14 @@ async function viewAlbum(id, stale) {
   title.onchange = async () => {
     const name = title.value.trim();
     if (!name) { title.value = al.name; return; }
-    await api('/api/albums/' + id, { method: 'PATCH', body: { name } });
+    // chaque lien de partage reçoit aussi le nouveau nom, chiffré avec sa propre clé
+    const shareNames = al.shared ? await Vault.syncShares(id, null, name) : {};
+    await api('/api/albums/' + id, { method: 'PATCH', body: { name: await Vault.sealName(name), shareNames } });
     al.name = name;
     toast('Album renommé');
   };
-  $('#share').onclick = () => shareModal(id);
-  $('#zip')?.addEventListener('click', () => (NATIVE ? downloadItems(g.items) : downloadUrl(`/api/albums/${id}/zip`)));
+  $('#share').onclick = () => shareModal(id, al.name, g.items);
+  $('#zip')?.addEventListener('click', () => downloadItems(g.items, al.name).catch(e => toast(e.message)));
   $('#del').onclick = async () => {
     if (!await confirmModal('Supprimer l’album ?', 'Les photos restent dans ta bibliothèque, seul l’album disparaît.', 'Supprimer', true)) return;
     await api('/api/albums/' + id, { method: 'DELETE' });
@@ -1167,45 +1217,58 @@ async function viewAlbum(id, stale) {
   g.load();
 }
 
-async function shareModal(albumId) {
+// Un lien de partage contient sa propre clé après le « # » : le serveur ne la voit jamais. Il ne garde
+// qu'une copie du lien chiffrée par la clé maître, pour que le propriétaire puisse le réafficher.
+async function shareModal(albumId, albumName, items) {
   await modal(`<h2>Partager l’album</h2>
-    <p>Toute personne qui a le lien peut voir l’album, sans compte.</p>
+    <p>Toute personne qui a le lien peut voir l’album, sans compte. La clé de déchiffrement est dans le lien lui-même :
+    transmets-le uniquement à qui tu veux.</p>
     <div id="links"></div>
     <label class="switch"><input type="checkbox" id="dl" checked> Autoriser le téléchargement</label>
     <label class="lbl" for="exp">Expiration</label>
-    <select class="field" id="exp"><option value="0">Jamais</option><option value="1">1 jour</option><option value="7">7 jours</option><option value="30">30 jours</option></select>
+    <select class="field" id="exp"><option value="0">Jamais</option><option value="1">1 jour</option><option value="7" selected>7 jours</option><option value="30">30 jours</option><option value="365">1 an</option></select>
     <div class="foot"><button class="btn" data-c>Fermer</button><button class="btn primary" data-create>${icon('link')}Créer un lien</button></div>`,
   (m, close) => {
     const list = m.querySelector('#links');
+    let synced = false;
     const load = async () => {
       const shares = await api(`/api/albums/${albumId}/shares`);
-      list.innerHTML = shares.map(s => {
-        const url = `${location.origin}/s/${s.token}`;
+      // photos ajoutées depuis un autre appareil sans que ce lien ait reçu leur clé : on la dépose maintenant
+      if (!synced && shares.some(s => s.missing > 0)) { synced = true; await Vault.syncShares(albumId, items); return load(); }
+      const rows = await Promise.all(shares.map(async s => {
+        let url = '';
+        try { url = (await Vault.shareKeyOf(s)).link; } catch { /* lien illisible */ }
         const meta = [s.allowDownload ? 'téléchargement autorisé' : 'lecture seule', s.expiresAt ? `expire le ${DF.short.format(s.expiresAt)}` : 'sans expiration'].join(' · ');
-        return `<div class="share-link"><div style="flex:1;min-width:0"><input class="field" readonly value="${esc(url)}"><small>${esc(meta)}</small></div>
-          <button class="icon-btn" data-copy="${esc(url)}" title="Copier">${icon('copy')}</button>
-          <button class="icon-btn" data-del="${esc(s.token)}" title="Supprimer le lien">${icon('trash')}</button></div>`;
-      }).join('');
+        return `<div class="share-link"><div style="flex:1;min-width:0"><input class="field" readonly value="${esc(url || 'lien illisible')}"><small>${esc(meta)}</small></div>
+          ${url ? `<button class="icon-btn" data-copy="${esc(url)}" title="Copier">${icon('copy')}</button>` : ''}
+          <button class="icon-btn" data-del="${s.id}" title="Supprimer le lien">${icon('trash')}</button></div>`;
+      }));
+      list.innerHTML = rows.join('');
     };
     m.onclick = async e => {
       const b = e.target.closest('button');
       if (!b) return;
-      if ('c' in b.dataset) return close();
-      if ('create' in b.dataset) {
-        await post(`/api/albums/${albumId}/shares`, { allowDownload: m.querySelector('#dl').checked, days: +m.querySelector('#exp').value });
-        await load();
-        const first = list.querySelector('[data-copy]');
-        if (first) { await copyText(first.dataset.copy, list.querySelector('input')); toast('Lien créé et copié'); }
-      } else if (b.dataset.copy) {
-        await copyText(b.dataset.copy, b.parentNode.querySelector('input'));
-        toast('Lien copié');
-      } else if (b.dataset.del) {
-        await api('/api/shares/' + b.dataset.del, { method: 'DELETE' });
-        await load();
-        toast('Lien supprimé : il ne fonctionne plus');
-      }
+      try {
+        if ('c' in b.dataset) return close();
+        if ('create' in b.dataset) {
+          b.disabled = true;
+          const link = await Vault.createShare(albumId, albumName, items, m.querySelector('#dl').checked, +m.querySelector('#exp').value);
+          await load();
+          b.disabled = false;
+          const input = [...list.querySelectorAll('input')].find(x => x.value === link);
+          await copyText(link, input);
+          toast('Lien créé et copié');
+        } else if (b.dataset.copy) {
+          await copyText(b.dataset.copy, b.parentNode.querySelector('input'));
+          toast('Lien copié');
+        } else if (b.dataset.del) {
+          await api('/api/shares/' + b.dataset.del, { method: 'DELETE' });
+          await load();
+          toast('Lien supprimé : il ne fonctionne plus');
+        }
+      } catch (err) { b.disabled = false; toast(err.message); }
     };
-    load();
+    load().catch(err => toast(err.message));
   });
 }
 
@@ -1356,158 +1419,365 @@ function renderAutoStatus(imp) {
 /* ---------- vue : réglages ---------- */
 async function viewSettings(stale) {
   setActive('settings');
-  const s = await api('/api/stats');
+  const [s, me] = await Promise.all([api('/api/stats'), api('/api/me')]);
   if (stale()) return;
   const u = state.user;
+  const onPhone = !!u.deviceId; // requête faite avec le certificat d'un téléphone appairé
   view().innerHTML = `<div class="settings">
     <div class="page-head"><div><h1>Réglages</h1></div></div>
     ${NATIVE ? `<div class="card"><h3>Cette app</h3><p>Dossiers sauvegardés, vidéos, batterie et état de la sauvegarde.</p>
       <button class="btn primary" id="nat-settings">${icon('settings')}Réglages de la sauvegarde</button></div>` : ''}
     <div class="card"><h3>Mon compte</h3>
       <p>Connecté en tant que <b>${esc(u.username)}</b>${u.isAdmin ? '<span class="tag">admin</span>' : ''}</p>
-      <form id="pw" class="form-row">
+      <p class="hint">Tes photos sont chiffrées sur tes appareils avant d’être envoyées. Le serveur ne peut pas les voir,
+      et personne ne peut réinitialiser ton mot de passe : garde ta <b>clé de secours</b> en lieu sûr.</p>
+      ${onPhone ? '' : `<form id="pw" class="form-row">
         <div><label class="lbl">Mot de passe actuel</label><input class="field" type="password" name="current" autocomplete="current-password" required></div>
-        <div><label class="lbl">Nouveau mot de passe</label><input class="field" type="password" name="new" minlength="8" autocomplete="new-password" required></div>
+        <div><label class="lbl">Nouveau mot de passe</label><input class="field" type="password" name="new" minlength="10" autocomplete="new-password" required></div>
         <button class="btn">Changer</button>
-      </form>
+        <label class="switch"><input type="checkbox" name="devices"> Déconnecter aussi mes téléphones (mot de passe compromis : il faudra les appairer de nouveau)</label>
+      </form>`}
       <div style="margin-top:18px"><button class="btn danger" id="logout">${icon('logout')}Se déconnecter</button></div>
     </div>
-    ${u.isAdmin ? `<div class="card"><h3>Comptes</h3><p>Chaque compte a sa propre photothèque, privée.</p>
+    <div class="card"><h3>Téléphones appairés</h3>
+      <p>Un téléphone appairé se connecte avec une clé qui ne quitte jamais sa puce de sécurité. Si tu en perds un, révoque-le ici.</p>
+      <table class="users" id="devices"></table>
+      ${onPhone ? '' : `<button class="btn primary" id="pair" style="margin-top:10px">${icon('camera')}Appairer un téléphone</button>`}
+    </div>
+    ${u.isAdmin ? `<div class="card"><h3>Comptes</h3><p>Chaque compte a sa propre photothèque, chiffrée avec ses propres clés.
+      Pour ajouter quelqu’un : « Inviter quelqu’un », puis la personne scanne le QR code avec l’app Pellicule
+      et choisit elle-même son mot de passe.</p>
       <table class="users" id="users"></table>
-      <form id="new-user" class="form-row" style="margin-top:6px">
-        <div><label class="lbl">Nom d'utilisateur</label><input class="field" name="username" autocapitalize="none" required></div>
-        <div><label class="lbl">Mot de passe (8+)</label><input class="field" name="password" type="password" minlength="8" autocomplete="new-password" required></div>
-        <button class="btn primary">${icon('plus')}Ajouter</button>
-      </form></div>` : ''}
+      <div class="form-row" style="margin-top:6px"><label class="switch"><input type="checkbox" id="inv-admin"> Administrateur</label>
+      <button class="btn primary" id="invite">${icon('plus')}Inviter quelqu’un</button></div>
+      <div id="invite-out"></div></div>` : ''}
     <div class="card"><h3>Serveur</h3>
       <p>${[plural(s.photos, 'photo', 'photos'), plural(s.videos, 'vidéo', 'vidéos'), `${fmtSize(s.bytes)} utilisés`, s.diskFree >= 0 ? `${fmtSize(s.diskFree)} libres` : ''].filter(Boolean).join(' · ')}</p>
-      <p>Miniatures HEIC / RAW (libvips) : <b>${s.tools.vips ? 'oui' : 'non installé'}</b> · Vidéos (ffmpeg) : <b>${s.tools.ffmpeg ? 'oui' : 'non installé'}</b>${s.pending ? ` · ${s.pending} miniature(s) en préparation` : ''}</p>
+      ${s.files ? `<p>${s.files.failed > 0
+        ? `<b>⚠ ${esc(plural(s.files.failed, 'fichier n’a pas pu être écrit', 'fichiers n’ont pas pu être écrits'))} sur le disque des photos</b>
+           (disque de la Freebox débranché ?). Nouvel essai chaque jour et au redémarrage du serveur ; d’ici là, une photo
+           concernée ne reviendrait pas si la VM était perdue.`
+        : s.files.lastSync ? `Reprise après perte de la VM : fichiers vérifiés le ${esc(new Date(s.files.lastSync).toLocaleString('fr-FR', { dateStyle: 'long', timeStyle: 'short' }))}.`
+        : 'Reprise après perte de la VM : première vérification en cours.'}
+        <br><span class="hint">Si la VM est perdue, chaque compte se reprend avec sa clé de secours.</span></p>
+        ${s.files.oddNames?.length ? `<p><b>⚠ Noms de compte hors des règles actuelles :</b> ${s.files.oddNames.map(esc).join(', ')}.
+          <span class="hint">Créés avec une version plus ancienne. Vérifie qu’aucun n’imite le nom de quelqu’un d’autre.</span></p>` : ''}` : ''}
+      ${me.certFingerprint ? `<p>Empreinte du certificat :<br><code class="fp">${esc(me.certFingerprint)}</code><br>
+        <span class="hint">Elle doit être identique à celle affichée par le serveur (<code>pellicule fingerprint</code>).
+        Si ton navigateur signale un jour un autre certificat, ne te connecte pas.</span></p>
+      ${window.PelliculeAndroid ? '' : `<p><a class="btn" href="/api/cert" download="pellicule.crt">${icon('download')}Certificat du serveur</a></p>`}
+      <p class="hint">À installer comme certificat de confiance sur tes ordinateurs (Windows : double-clic → Installer →
+      « Autorités de certification racines de confiance ») : plus d’avertissement, une alerte claire si un faux serveur
+      apparaît, et la lecture des longues vidéos sans tout télécharger. L’app Android n’en a pas besoin.</p>` : ''}
       <p>Pellicule ${esc(state.version)}</p>
     </div></div>`;
 
-  $('#pw').onsubmit = async e => {
+  $('#pw')?.addEventListener('submit', async e => {
     e.preventDefault();
-    const f = e.target;
+    const f = e.target, btn = f.querySelector('button');
+    btn.disabled = true;
     try {
-      await post('/api/me/password', { current: f.current.value, new: f.new.value });
+      const devices = f.devices.checked;
+      await Vault.changePassword(f.current.value, f.new.value, devices);
       f.reset();
-      toast('Mot de passe modifié');
+      toast(devices ? 'Mot de passe modifié. Les autres navigateurs et tes téléphones ont été déconnectés.'
+        : 'Mot de passe modifié. Les autres navigateurs ont été déconnectés.');
+      if (devices) loadDevices().catch(() => {});
     } catch (err) { toast(err.message); }
-  };
+    btn.disabled = false;
+  });
   $('#nat-settings')?.addEventListener('click', () => NATIVE.openSettings());
   $('#logout').onclick = async () => {
     if (NATIVE) {
-      if (await confirmModal('Se déconnecter ?', 'La sauvegarde automatique de ce téléphone s’arrêtera jusqu’à la prochaine connexion.', 'Se déconnecter', true)) {
-        await post('/api/logout', {}).catch(() => {});
+      if (await confirmModal('Se déconnecter ?', 'Ce téléphone sera révoqué et oubliera ses clés. Il faudra l’appairer de nouveau.', 'Se déconnecter', true)) {
+        await post('/api/devices/self/revoke', {}).catch(() => {});
+        await Vault.forget();
         NATIVE.logout();
       }
       return;
     }
-    await post('/api/logout', {});
+    await post('/api/logout', {}).catch(() => {});
+    await Vault.forget();
     state.user = null;
     boot();
   };
+
+  const loadDevices = async () => {
+    const devs = await api('/api/devices');
+    $('#devices').innerHTML = devs.length ? devs.map(d => `<tr><td><b>${esc(d.name)}</b>${d.current ? '<span class="tag">celui-ci</span>' : ''}</td>
+      <td>appairé le ${DF.short.format(d.createdAt)} · vu le ${DF.short.format(d.lastSeen)}</td>
+      <td>${onPhone ? '' : `<button class="btn danger" data-revoke="${d.id}" data-name="${esc(d.name)}">Révoquer</button>`}</td></tr>`).join('')
+      : '<tr><td>Aucun téléphone appairé.</td></tr>';
+  };
+  $('#devices').onclick = async e => {
+    const b = e.target.closest('[data-revoke]');
+    if (!b) return;
+    if (!await confirmModal(`Révoquer ${b.dataset.name} ?`, 'Ce téléphone ne pourra plus se connecter au serveur. Les photos déjà présentes sur lui y restent.', 'Révoquer', true)) return;
+    await api('/api/devices/' + b.dataset.revoke, { method: 'DELETE' }).catch(err => toast(err.message));
+    loadDevices();
+  };
+  $('#pair')?.addEventListener('click', () => pairModal().catch(err => toast(err.message)).then(loadDevices));
+  loadDevices().catch(() => {});
 
   if (!u.isAdmin) return;
   const loadUsers = async () => {
     const users = await api('/api/users');
     $('#users').innerHTML = users.map(x => `<tr><td><b>${esc(x.username)}</b>${x.isAdmin ? '<span class="tag">admin</span>' : ''}</td>
       <td>${countLabel(x.count)} · ${fmtSize(x.bytes)}</td>
-      <td><button class="btn" data-pw="${x.id}" data-name="${esc(x.username)}">Mot de passe</button>
-      ${x.id === u.id ? '' : `<button class="icon-btn" data-del="${x.id}" data-name="${esc(x.username)}" title="Supprimer">${icon('trash')}</button>`}</td></tr>`).join('');
+      <td>${x.id === u.id || onPhone ? '' : `<button class="icon-btn" data-del="${x.id}" data-name="${esc(x.username)}" title="Supprimer">${icon('trash')}</button>`}</td></tr>`).join('');
   };
   $('#users').onclick = async e => {
     const b = e.target.closest('button');
-    if (!b) return;
+    if (!b?.dataset.del) return;
     try {
-      if (b.dataset.pw) {
-        const pw = await promptModal(`Nouveau mot de passe pour ${b.dataset.name}`, { type: 'password', ok: 'Enregistrer', text: '8 caractères minimum. Ses sessions ouvertes seront déconnectées.' });
-        if (!pw) return;
-        await post(`/api/users/${b.dataset.pw}/password`, { password: pw });
-        toast('Mot de passe modifié');
-      } else if (b.dataset.del) {
-        if (!await confirmModal(`Supprimer ${b.dataset.name} ?`, 'Le compte, ses albums et ses liens de partage sont supprimés. Ses fichiers originaux restent sur le disque.', 'Supprimer', true)) return;
-        await api('/api/users/' + b.dataset.del, { method: 'DELETE' });
-        loadUsers();
-      }
+      if (!await confirmModal(`Supprimer ${b.dataset.name} ?`, 'Le compte et toutes ses photos chiffrées sont effacés du serveur. Impossible à annuler.', 'Supprimer', true)) return;
+      await api('/api/users/' + b.dataset.del, { method: 'DELETE' });
+      loadUsers();
     } catch (err) { toast(err.message); }
   };
-  $('#new-user').onsubmit = async e => {
-    e.preventDefault();
-    const f = e.target;
+  $('#invite').onclick = async () => {
     try {
-      await post('/api/users', { username: f.username.value.trim(), password: f.password.value });
-      f.reset();
-      toast('Compte créé');
-      loadUsers();
+      const r = await post('/api/invites', { isAdmin: $('#inv-admin').checked });
+      const link = `${location.origin}/#invite=${r.token}`;
+      // QR code pour l'app : adresse et invitation, plus l'empreinte du certificat si on est dans l'app (voir pinnedFP)
+      const payload = 'pellicule:invite?' + new URLSearchParams({ url: location.origin, ...pinnedFP(), token: r.token });
+      $('#invite-out').innerHTML = `<div class="qr">${QR.svg(payload)}</div>
+        <p class="hint">À scanner avec l’app Pellicule (« Scanner le QR code »). Une seule personne, jusqu’au ${esc(DF.short.format(r.expiresAt))}.
+        Sans l’app : ce lien, à ouvrir dans un navigateur.</p>
+        <div class="share-link"><div style="flex:1;min-width:0"><input class="field" readonly value="${esc(link)}"></div>
+        <button class="icon-btn" title="Copier">${icon('copy')}</button></div>`;
+      const input = $('#invite-out input');
+      $('#invite-out button').onclick = () => copyText(link, input).then(() => toast('Lien copié'));
     } catch (err) { toast(err.message); }
   };
   loadUsers();
 }
 
+// Empreinte à mettre dans un QR code : seulement celle que l'app a épinglée elle-même. Dans un navigateur,
+// l'empreinte viendrait d'une page fournie par le serveur, peut-être un faux (R1) : sans elle, l'app scanne le
+// QR code puis fait vérifier l'empreinte du serveur qu'elle joint (deux groupes à recopier).
+function pinnedFP() {
+  const fp = NATIVE?.fingerprint?.() || '';
+  return /^[0-9a-f]{64}$/.test(fp) ? { fp } : {};
+}
+
+// Appairage : le QR code contient l'adresse du serveur et un code à usage unique valable 5 minutes.
+async function pairModal() {
+  const r = await post('/api/devices/pair-code', {});
+  const payload = 'pellicule:pair?' + new URLSearchParams({ url: location.origin, ...pinnedFP(), code: r.code, user: r.username });
+  await modal(`<h2>Appairer un téléphone</h2>
+    <p>Dans l’app Pellicule du téléphone, touche <b>Scanner le QR code</b>.</p>
+    <div class="qr">${QR.svg(payload)}</div>
+    <p class="hint">Sans appareil photo : saisis l’adresse <b>${esc(location.origin)}</b> et le code <b class="code">${esc(r.code)}</b>.
+    Valable 5 minutes, une seule fois. L’app te demandera ensuite ton mot de passe.</p>
+    <div class="foot"><button class="btn primary" data-c>Terminé</button></div>`,
+  (m, close) => {
+    m.querySelector('[data-c]').onclick = () => close();
+    setTimeout(() => close(), r.expiresAt - Date.now());
+  });
+}
+
 /* =========================================================
-   Connexion / première configuration
+   Connexion, création de compte, clé de secours
    ========================================================= */
-function renderAuth(needsSetup) {
+const authCard = inner => {
   app.className = 'auth';
-  app.innerHTML = `<form class="auth-card" id="auth">
-    <div class="logo">${logoMark}<span>Pellicule</span></div>
-    <h1>${needsSetup ? 'Bienvenue' : 'Connexion'}</h1>
-    <p>${needsSetup ? 'Crée le compte administrateur pour commencer.' : 'Tes photos, chez toi.'}</p>
-    <label class="lbl" for="u">Nom d'utilisateur</label>
-    <input class="field" id="u" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
-    <label class="lbl" for="p">Mot de passe${needsSetup ? ' (8 caractères minimum)' : ''}</label>
-    <input class="field" id="p" type="password" name="password" autocomplete="${needsSetup ? 'new-password' : 'current-password'}" ${needsSetup ? 'minlength="8"' : ''} required>
-    <button class="btn primary">${needsSetup ? 'Créer le compte' : 'Se connecter'}</button>
-    <div class="err" id="err"></div>
-  </form>`;
-  $('#u').focus();
-  $('#auth').onsubmit = async e => {
+  app.innerHTML = `<form class="auth-card" id="auth" autocomplete="on"><div class="logo">${logoMark}<span>Pellicule</span></div>${inner}<div class="err" id="err"></div></form>`;
+  return $('#auth');
+};
+
+// PBKDF2 (600 000 tours) prend une à deux secondes sur un téléphone : on affiche ce qui se passe.
+function bindAuth(form, run, busyLabel = 'Déverrouillage…') {
+  form.onsubmit = async e => {
     e.preventDefault();
-    const f = e.target;
-    const btn = f.querySelector('button');
+    const btn = form.querySelector('button.primary');
+    const label = btn.textContent;
     btn.disabled = true;
+    btn.textContent = busyLabel;
     $('#err').textContent = '';
-    try {
-      await api(needsSetup ? '/api/setup' : '/api/login', { method: 'POST', body: { username: f.username.value.trim(), password: f.password.value }, noRedirect: true });
-      boot();
-    } catch (err) {
-      $('#err').textContent = err.message;
+    try { await run(form); } catch (err) {
+      $('#err').textContent = err.status === 401 ? 'Identifiants incorrects' : err.message;
       btn.disabled = false;
+      btn.textContent = label;
     }
   };
 }
 
-/* =========================================================
-   Page publique d'un album partagé
-   ========================================================= */
-async function bootShare(token) {
-  let r;
-  try {
-    r = await api('/api/s/' + token, { noRedirect: true });
-  } catch (e) {
-    app.className = 'auth';
-    app.innerHTML = `<div class="auth-card"><div class="logo">${logoMark}<span>Pellicule</span></div><h1>Lien indisponible</h1><p>${esc(e.message)}</p></div>`;
+function checkNewPassword(pw, pw2) {
+  if (pw.length < 10) throw new Error('Mot de passe trop court (10 caractères minimum)');
+  if (pw !== pw2) throw new Error('Les deux mots de passe ne correspondent pas');
+}
+
+const newPasswordFields = (hint = true) => `
+  <label class="lbl" for="p">Mot de passe (10 caractères minimum)</label>
+  <input class="field" id="p" type="password" name="password" autocomplete="new-password" minlength="10" required>
+  <label class="lbl" for="p2">Confirmation</label>
+  <input class="field" id="p2" type="password" name="password2" autocomplete="new-password" minlength="10" required>
+  ${hint ? `<p class="hint">Ce mot de passe chiffre tes photos : personne, pas même l’administrateur, ne pourra le réinitialiser.
+  Seule la clé de secours affichée à l’étape suivante permet de le remplacer.</p>` : ''}`;
+
+function renderLogin() {
+  const f = authCard(`<h1>Connexion</h1><p>Tes photos, chez toi.</p>
+    <label class="lbl" for="u">Nom d'utilisateur</label>
+    <input class="field" id="u" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+    <label class="lbl" for="p">Mot de passe</label>
+    <input class="field" id="p" type="password" name="password" autocomplete="current-password" required>
+    <button class="btn primary">Se connecter</button>
+    <a class="link" href="#recover">Mot de passe oublié ?</a>`);
+  $('#u').focus();
+  bindAuth(f, async f => {
+    await Vault.login(f.username.value.trim(), f.password.value);
+    boot();
+  });
+}
+
+// session valide, mais ce navigateur n'a plus les clés (données du site effacées) : on redemande le mot de passe
+function renderUnlock(user) {
+  const f = authCard(`<h1>Déverrouiller</h1><p>Connecté en tant que <b>${esc(user.username)}</b>. Saisis ton mot de passe pour déchiffrer tes photos sur cet appareil.</p>
+    <input type="text" name="username" value="${esc(user.username)}" autocomplete="username" hidden>
+    <label class="lbl" for="p">Mot de passe</label>
+    <input class="field" id="p" type="password" name="password" autocomplete="current-password" required>
+    <button class="btn primary">Déverrouiller</button>
+    <button type="button" class="btn" id="other">Changer de compte</button>`);
+  $('#p').focus();
+  $('#other').onclick = async () => { await post('/api/logout', {}).catch(() => {}); await Vault.forget(); boot(); };
+  bindAuth(f, async f => { await Vault.unlock(user.username, f.password.value); boot(); });
+}
+
+function renderSetup() {
+  const f = authCard(`<h1>Bienvenue</h1><p>Crée le compte administrateur. Le <b>code d’installation</b> a été affiché à la fin de
+    l’installation (ou : <code>pellicule setup-code</code> sur le serveur).</p>
+    <label class="lbl" for="c">Code d’installation</label>
+    <input class="field" id="c" name="code" autocomplete="off" autocapitalize="characters" spellcheck="false" required>
+    <label class="lbl" for="u">Nom d'utilisateur</label>
+    <input class="field" id="u" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+    ${newPasswordFields()}
+    <button class="btn primary">Créer le compte</button>`);
+  $('#c').focus();
+  bindAuth(f, async f => {
+    checkNewPassword(f.password.value, f.password2.value);
+    const rec = await Vault.createAccount('/api/setup', f.username.value.trim(), f.password.value, { setupCode: f.code.value.trim() });
+    showRecoveryKey(rec);
+  }, 'Création des clés…');
+}
+
+async function renderRegister(token) {
+  let inv;
+  try { inv = await api('/api/invites/' + encodeURIComponent(token), { noRedirect: true }); } catch (e) {
+    authCard(`<h1>Invitation</h1><p>${esc(e.message)}</p>`);
     return;
   }
-  const al = r.album;
-  document.title = `${al.name} · Pellicule`;
+  const f = authCard(`<h1>Créer ton compte</h1><p>Tu as été invité${inv.isAdmin ? ' comme administrateur' : ''} sur ce serveur Pellicule.</p>
+    <label class="lbl" for="u">Nom d'utilisateur</label>
+    <input class="field" id="u" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+    ${newPasswordFields()}
+    <button class="btn primary">Créer mon compte</button>`);
+  $('#u').focus();
+  bindAuth(f, async f => {
+    checkNewPassword(f.password.value, f.password2.value);
+    const rec = await Vault.createAccount('/api/register', f.username.value.trim(), f.password.value, { token });
+    history.replaceState(null, '', '/');
+    showRecoveryKey(rec);
+  }, 'Création des clés…');
+}
+
+// La clé de secours n'est affichée qu'une fois : sans elle, un mot de passe oublié = photos perdues.
+function showRecoveryKey(rec) {
+  const groups = rec.split('-');
+  const f = authCard(`<h1>Ta clé de secours</h1>
+    <p>Note-la maintenant, sur papier ou dans un gestionnaire de mots de passe. <b>Elle ne sera plus jamais affichée.</b></p>
+    <div class="recovery">${groups.map((g, i) => `<span class="rg"><small>${i + 1}.</small>${esc(g)}</span>`).join(' ')}</div>
+    <div class="form-row"><button type="button" class="btn" id="copy-rec">${icon('copy')}Copier</button></div>
+    <h2 class="rules">Les règles</h2>
+    <ul class="rules">
+      <li><b>Mot de passe oublié</b> : cette clé est le seul moyen de retrouver tes photos.</li>
+      <li><b>Serveur perdu ou réinstallé</b> : tes photos restent sur le disque, mais il faudra cette clé pour y retrouver accès.
+        Sans elle, elles sont perdues pour toujours.</li>
+      <li>Personne ne peut la retrouver à ta place, pas même l’administrateur : elle n’est enregistrée nulle part.</li>
+      <li>Garde-la ailleurs que sur ce serveur, comme un double de clé.</li>
+    </ul>
+    <button class="btn primary">Je l’ai notée</button>`);
+  $('#copy-rec').onclick = () => navigator.clipboard?.writeText(rec).then(() => toast('Clé copiée'));
+  f.onsubmit = e => { e.preventDefault(); verifyRecoveryKey(rec); };
+}
+
+// Recopier deux groupes tirés au hasard : une case « j’ai noté » se coche sans rien noter.
+function verifyRecoveryKey(rec) {
+  const groups = rec.split('-');
+  const r = new Uint32Array(2);
+  let a, b;
+  do { crypto.getRandomValues(r); a = r[0] % groups.length; b = r[1] % groups.length; } while (a === b);
+  [a, b] = [Math.min(a, b), Math.max(a, b)];
+  const f = authCard(`<h1>Vérification</h1>
+    <p>Depuis ce que tu as noté, recopie le groupe n° ${a + 1} puis le groupe n° ${b + 1} de ta clé de secours.</p>
+    <input class="field" id="g" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Groupes n° ${a + 1} et n° ${b + 1}" required>
+    <button class="btn primary">Valider</button>
+    <a class="link" href="#" id="back">Revoir la clé</a>`);
+  $('#g').focus();
+  $('#back').onclick = e => { e.preventDefault(); showRecoveryKey(rec); };
+  f.onsubmit = e => {
+    e.preventDefault();
+    const typed = f.querySelector('#g').value.toUpperCase().replace(/[^A-Z2-7]/g, '');
+    if (typed === groups[a] + groups[b]) boot();
+    else $('#err').textContent = 'Ce n’est pas ça. Vérifie ce que tu as noté, ou reviens à la clé.';
+  };
+}
+
+function renderRecover() {
+  const f = authCard(`<h1>Mot de passe oublié</h1><p>Saisis ta clé de secours pour choisir un nouveau mot de passe. Tes autres appareils seront déconnectés.</p>
+    <label class="lbl" for="u">Nom d'utilisateur</label>
+    <input class="field" id="u" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+    <label class="lbl" for="r">Clé de secours</label>
+    <input class="field" id="r" name="recovery" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD-EFGH-…" required>
+    ${newPasswordFields(false)}
+    <button class="btn primary">Changer le mot de passe</button>
+    <a class="link" href="#">Retour à la connexion</a>`);
+  $('#u').focus();
+  bindAuth(f, async f => {
+    checkNewPassword(f.password.value, f.password2.value);
+    await Vault.recover(f.username.value.trim(), f.recovery.value, f.password.value);
+    history.replaceState(null, '', '/');
+    boot();
+  }, 'Vérification…');
+}
+
+/* =========================================================
+   Page publique d'un album partagé (déchiffrée avec la clé du fragment #)
+   ========================================================= */
+async function bootShare(token) {
+  let r, share, name;
+  try {
+    share = await Vault.shareFromURL(token);
+    r = await api('/api/s/' + token, { noRedirect: true });
+    name = await Vault.openName(r.name, share.sk);
+    if (name === '(nom illisible)') throw new Error('Lien invalide : la clé ne correspond pas à cet album');
+  } catch (e) {
+    authCard(`<h1>Lien indisponible</h1><p>${esc(e.message)}</p>`);
+    return;
+  }
+  share.allowDownload = r.allowDownload;
+  const src = { share };
+  await Vault.hydrate(r.items, src);
+  const items = r.items.filter(a => !a.broken);
+  const start = Math.min(...items.map(a => a.takenAt)), end = Math.max(...items.map(a => a.takenAt));
+  document.title = `${name} · Pellicule`;
   app.className = '';
   app.innerHTML = `<div class="share-head">
       <div class="logo">${logoMark}<span>Pellicule</span></div>
-      <div class="page-head" style="margin:0 0 10px"><div><h1>${esc(al.name)}</h1>
-        <div class="sub">${[countLabel(al.count), fmtRange(al.startAt, al.endAt), r.owner ? `partagé par ${r.owner}` : ''].filter(Boolean).map(esc).join(' · ')}</div></div>
-        <div class="actions">${r.allowDownload && al.count ? `<a class="btn primary" href="/api/s/${token}/zip" download>${icon('download')}Tout télécharger</a>` : ''}</div></div>
+      <div class="page-head" style="margin:0 0 10px"><div><h1>${esc(name)}</h1>
+        <div class="sub">${[countLabel(items.length), items.length ? fmtRange(start, end) : '', r.owner ? `partagé par ${r.owner}` : ''].filter(Boolean).map(esc).join(' · ')}</div></div>
+        <div class="actions">${r.allowDownload && items.length ? `<button class="btn primary" id="zip">${icon('download')}Tout télécharger</button>` : ''}</div></div>
     </div><div class="share-wrap" id="gal"></div>`;
   const g = new Gallery($('#gal'), {
     public: true,
+    src,
     groupBy: a => dKey(a.takenAt),
     groupLabel: a => dayLabel(a.takenAt),
-    thumbUrl: a => `/api/s/${token}/assets/${a.id}/thumb`,
-    load: async () => ({ items: r.items, next: '' }),
+    load: async () => ({ items, next: '' }),
     empty: emptyState('album', 'Album vide', 'Rien à voir ici pour l’instant.'),
-    open: i => openViewer(g, i, { share: { token, allowDownload: r.allowDownload } }),
+    open: i => openViewer(g, i, { share }),
   });
+  $('#zip')?.addEventListener('click', () => downloadItems(items, name).catch(e => toast(e.message)));
   g.load();
 }
 
@@ -1519,19 +1789,56 @@ async function boot() {
   try {
     me = await api('/api/me', { noRedirect: true });
   } catch (e) {
-    app.className = 'auth';
-    app.innerHTML = `<div class="auth-card"><div class="logo">${logoMark}<span>Pellicule</span></div><h1>Serveur injoignable</h1><p>${esc(e.message)}</p><button class="btn primary" onclick="location.reload()">Réessayer</button></div>`;
+    authCard(`<h1>Serveur injoignable</h1><p>${esc(e.message)}</p><button type="button" class="btn primary" id="retry">Réessayer</button>`);
+    $('#retry').onclick = () => location.reload();
     return;
   }
   state.version = me.version;
-  if (!me.user) return renderAuth(me.needsSetup);
+  const inv = location.hash.match(/^#invite=([0-9a-f]+)$/);
+  if (inv && !me.user) return renderRegister(inv[1]);
+  if (!me.user) {
+    // dans l'app : le serveur ne reconnaît plus ce téléphone (révoqué) → il efface ses clés et se réappaire
+    // (l'app le vérifie elle-même par sa propre connexion avant d'effacer quoi que ce soit)
+    if (NATIVE?.checkRevoked) {
+      authCard('<h1>Vérification…</h1><p>Le serveur ne reconnaît pas ce téléphone.</p>');
+      return NATIVE.checkRevoked();
+    }
+    await Vault.forget(); // session expirée ou déconnectée ailleurs : la clé maître ne reste pas dans ce navigateur
+    if (me.needsSetup) return renderSetup();
+    if (location.hash === '#recover') return renderRecover();
+    return renderLogin();
+  }
+  if (!await Vault.restore(me.user.username)) return renderUnlock(me.user);
   state.user = me.user;
+  if (!/^#\//.test(location.hash)) history.replaceState(null, '', '/#/');
   renderShell();
   route();
   refreshUsage();
+  rewrapImported();
 }
 
-if ('serviceWorker' in navigator && window.isSecureContext) {
+// Fichiers importés par FolderSync : leur clé est scellée pour la clé publique du compte. Dès qu'un
+// appareil déverrouillé passe, il les rechiffre avec la clé maître (le serveur ne peut pas le faire).
+async function rewrapImported() {
+  try {
+    let next = '';
+    do {
+      const r = await api('/api/timeline?sealed=1&limit=500' + (next ? '&cursor=' + next : ''));
+      await Vault.hydrate(r.items, { owner: true });
+      next = r.next;
+    } while (next);
+    await Vault.flushRewrap();
+  } catch { /* on réessaiera au prochain démarrage */ }
+}
+
+// pages hors connexion (invitation, secours) : navigation par le fragment
+addEventListener('hashchange', () => { if (!state.user) boot(); });
+
+// Dans l'app Android, l'interface vient de l'APK et les vidéos sont déchiffrées par l'app : pas de service
+// worker (la CSP de l'app l'interdit), et ceux d'anciennes versions sont retirés.
+if (window.PelliculeAndroid) {
+  navigator.serviceWorker?.getRegistrations?.().then(rs => rs.forEach(r => r.unregister())).catch(() => {});
+} else if ('serviceWorker' in navigator && window.isSecureContext) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
 boot();

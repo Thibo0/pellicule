@@ -11,40 +11,50 @@ Galerie photo auto-hébergée pour la maison : un serveur qui tourne sur une VM 
 
 ---
 
-## 1. Installer le serveur (une seule fois)
+## Installation (10 minutes, une seule fois)
 
-Il faut une VM **Debian ou Ubuntu**, par exemple celle d'AdGuard sur la Freebox.
+Il faut une VM **Debian ou Ubuntu** (par exemple celle d'AdGuard sur la Freebox) et un téléphone **Android**.
 
-1. Dans **Freebox OS → Paramètres de la Freebox → Partages Windows**, activer le partage, puis choisir un utilisateur et un mot de passe. C'est là que les photos seront stockées.
-2. Copier l'archive sur la VM. Depuis un PC :
-   ```bash
-   scp pellicule-{{VERSION}}.tar.gz utilisateur@IP-de-la-VM:
-   ```
-3. Sur la VM :
+1. Dans **Freebox OS → Paramètres de la Freebox → Partages Windows**, activer le partage et choisir un utilisateur
+   et un mot de passe. C'est là que les photos (chiffrées) seront rangées.
+2. Copier l'archive sur la VM, puis sur la VM :
    ```bash
    tar xzf pellicule-{{VERSION}}.tar.gz
    cd pellicule-{{VERSION}}
    sudo ./install.sh
    ```
-   Le script pose quelques questions (adresse de la Freebox, nom du partage, utilisateur, mot de passe). À la fin, il affiche l'adresse du serveur, par exemple `http://192.168.1.50:8420`.
-4. Ouvrir cette adresse dans un navigateur et créer le **compte administrateur**. Les autres comptes (famille…) se créent dans **Réglages**.
+   Répondre aux questions sur le partage. Pour le reste, la touche Entrée suffit. À la fin, **un QR code s'affiche**.
+3. Sur le téléphone : installer **`pellicule-android-{{VERSION}}.apk`**. Android demande d'autoriser l'installation
+   d'applis inconnues : accepter.
+4. Ouvrir l'app → **Scanner le QR code** → choisir son nom et son mot de passe → **noter la clé de secours**
+   sur papier. C'est fini : les photos du téléphone partent toutes seules, chiffrées, dès qu'il est sur le Wi-Fi de la maison.
 
-## 2. Installer l'app Android
+**Ajouter quelqu'un** (famille…) : dans l'app, **Réglages → Inviter quelqu'un**, puis l'autre personne installe l'app et
+scanne le QR code affiché.
 
-1. Sur le téléphone, télécharger **`pellicule-android-{{VERSION}}.apk`**. Il est aussi dans l'archive.
-2. L'ouvrir. Android demande d'**autoriser l'installation d'applis inconnues** : accepter pour le navigateur ou le gestionnaire de fichiers.
-3. Au premier lancement, saisir l'adresse du serveur (ex. `192.168.1.50:8420`), l'utilisateur et le mot de passe, puis autoriser l'accès à **toutes** les photos.
+**Nouveau téléphone** : installer l'app → **J'ai déjà un compte** → adresse du serveur, nom, mot de passe.
 
-Les photos se sauvegardent ensuite toutes seules en Wi-Fi à la maison, sans jamais être envoyées deux fois.
+> **La règle : la clé de secours.** Tout est chiffré sur le téléphone : ni le serveur ni le disque de la Freebox
+> ne peuvent voir les photos, et personne ne peut réinitialiser un mot de passe. La clé de secours de chaque compte est
+> le **seul** moyen de retrouver ses photos si le mot de passe est oublié **ou si la VM est perdue**. Sans elle, les
+> photos du compte sont perdues pour toujours. Chaque personne invitée reçoit la sienne et doit la noter.
 
-**iPhone :** il n'y a pas d'app. Ouvrir l'adresse dans Safari → Partager → *Sur l'écran d'accueil*, puis *Sauvegarde* → *Choisir des photos*.
+**Si la VM est perdue :** sur une VM neuve, relancer `sudo ./install.sh` avec le même disque de la Freebox. Le script
+liste les comptes trouvés sur le disque ; vérifier les noms, taper `RECONSTRUIRE`. Puis, sur chaque téléphone, scanner
+le QR code affiché → **Mot de passe oublié / serveur réinstallé** → nom, clé de secours, nouveau mot de passe.
+
+**iPhone ou ordinateur :** ouvrir `https://<adresse du serveur>:8420` dans le navigateur. Il y a un avertissement de
+certificat la première fois : c'est normal, le certificat est propre à ton serveur. Se connecter avec son nom et son mot de passe.
 
 ---
 
 ## Mettre à jour
 
 - **Serveur :** copier la nouvelle archive sur la VM, la décompresser, lancer `sudo ./install.sh` et répondre **O** à « Mettre à jour ». Les photos et les comptes sont conservés.
+  *Depuis une 0.4 :* la 0.5 chiffre tout et ne peut pas reprendre une base 0.4 (photos en clair). Le serveur refuse de démarrer
+  et explique quoi déplacer pour repartir de zéro.
 - **App Android :** installer le nouvel APK par-dessus l'ancien. Il n'y a rien à désinstaller.
+  L'interface de l'app est dans l'APK (le serveur ne peut pas la modifier) : mettre à jour le serveur ET l'app, en même temps.
 
 ## En cas de problème
 
@@ -54,4 +64,5 @@ journalctl -u pellicule -f      # journaux en direct
 sudo mount -a                   # remonter le disque de la Freebox (après un redémarrage)
 ```
 
-Le guide complet (accès depuis l'extérieur, nom `photos.maison`, FolderSync…) est dans le `README.md` de l'archive.
+Le guide complet (accès depuis l'extérieur, nom `photos.maison`, FolderSync, reconstruction après perte de la VM…) est dans le `README.md` de l'archive,
+et le fonctionnement du chiffrement dans `docs/SECURITE.md`.

@@ -1,0 +1,47 @@
+# Tests à chaque envoi et à chaque pull request : serveur (Go), chiffrement de la page (Node),
+# chiffrement de l'app (JVM). Les trois implémentations sont vérifiées contre testdata/vectors.json.
+name: Tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # actions épinglées par commit (mêmes versions que release.yml)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: Serveur (go vet, go test)
+        run: |
+          test -z "$(gofmt -l *.go)" || { gofmt -l *.go; echo "fichiers non formatés (gofmt)"; exit 1; }
+          go vet ./...
+          go test -count=1 ./...
+
+      # Node est déjà installé sur les machines ubuntu-latest : pas d'action supplémentaire à épingler
+      - name: Page web (node --test)
+        run: |
+          node --version
+          node --test web/crypto.test.mjs
+
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+
+      - name: App Android (tests unitaires)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest

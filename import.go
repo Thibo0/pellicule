@@ -1,15 +1,15 @@
 package main
 
-// Import automatique : chaque utilisateur a un dossier <library>/Import/<utilisateur> que le téléphone
-// remplit tout seul (FolderSync en Wi-Fi, etc.). Les fichiers y sont indexés sur place, sans être
-// déplacés : l'appli de synchro les retrouve là où elle les a mis et ne les renvoie pas.
+// Import automatique (FolderSync…) : chaque compte a un dossier <library>/Import/<utilisateur> que le
+// téléphone remplit en Wi-Fi. Ces fichiers arrivent en clair sur le partage de la Freebox : le serveur
+// les voit donc forcément. Il en fait les miniatures, chiffre le tout avec une clé de fichier neuve,
+// scelle cette clé pour la clé PUBLIQUE du compte (il ne peut plus la rouvrir ensuite), puis SUPPRIME
+// le fichier en clair. Le client du propriétaire rechiffre ensuite la clé avec sa clé maître.
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -33,6 +33,16 @@ type importState struct {
 	running  bool
 }
 
+// Meta : métadonnées d'un fichier, chiffrées par sa clé (même format pour tous les clients).
+type Meta struct {
+	Name     string  `json:"name"`
+	Mime     string  `json:"mime"`
+	Width    int     `json:"w,omitempty"`
+	Height   int     `json:"h,omitempty"`
+	Duration float64 `json:"dur,omitempty"`
+	Size     int64   `json:"size"` // taille du clair
+}
+
 func (a *App) importRel(username string) string {
 	return filepath.ToSlash(filepath.Join(importDir, username))
 }
@@ -47,6 +57,12 @@ func (a *App) importer() {
 	}
 }
 
+type importUser struct {
+	id   int64
+	name string
+	pub  []byte
+}
+
 func (a *App) scanImports() {
 	a.imp.mu.Lock()
 	if a.imp.running {
@@ -56,16 +72,13 @@ func (a *App) scanImports() {
 	a.imp.running = true
 	a.imp.mu.Unlock()
 
-	type user struct {
-		id   int64
-		name string
-	}
-	var users []user
-	rows, err := a.db.Query(`SELECT id, username FROM users`)
+	var users []importUser
+	// compte reconstruit pas encore repris : sa clé publique vient du disque, non vérifiée par l'app (rebuild.go)
+	rows, err := a.db.Query(`SELECT id, username, pub_key FROM users WHERE auth_hash <> ''`)
 	if err == nil {
 		for rows.Next() {
-			var u user
-			rows.Scan(&u.id, &u.name)
+			var u importUser
+			rows.Scan(&u.id, &u.name, &u.pub)
 			users = append(users, u)
 		}
 		rows.Close()
@@ -91,6 +104,11 @@ func (a *App) scanImports() {
 			if d.IsDir() {
 				return nil
 			}
+			// fichiers ordinaires seulement : un lien symbolique déposé sur le partage ferait chiffrer
+			// (et livrer au compte) un fichier quelconque de la machine
+			if !d.Type().IsRegular() {
+				return nil
+			}
 			kind, mime, ok := mediaType(d.Name())
 			if !ok {
 				return nil
@@ -104,31 +122,25 @@ func (a *App) scanImports() {
 				return nil
 			}
 			rel = filepath.ToSlash(rel)
-			size, mtime := info.Size(), info.ModTime().UnixMilli()
-
-			var seenSize, seenMtime int64
-			if a.db.QueryRow(`SELECT size, mtime FROM import_seen WHERE path=?`, rel).Scan(&seenSize, &seenMtime) == nil &&
-				seenSize == size && seenMtime == mtime {
+			// FolderSync renvoie parfois un fichier qu'on a supprimé après import : même chemin et même taille = ignoré
+			var seenSize int64
+			if a.db.QueryRow(`SELECT size FROM import_seen WHERE path=?`, rel).Scan(&seenSize) == nil && seenSize == info.Size() {
+				os.Remove(p)
 				return nil
 			}
-			created, err := a.importFile(u.id, p, rel, kind, mime, size, info.ModTime())
-			if err != nil {
+			if err := a.importFile(u, p, kind, mime, info); err != nil {
 				log.Printf("import de %s : %v", rel, err)
 				return nil
 			}
-			if created {
-				added++
-			}
-			// on garde la trace même après suppression dans Pellicule : un fichier renvoyé à l'identique reste ignoré
+			added++
 			a.db.Exec(`INSERT INTO import_seen(path, size, mtime) VALUES (?,?,?)
-				ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime`, rel, size, mtime)
+				ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime`, rel, info.Size(), info.ModTime().UnixMilli())
 			return nil
 		})
 	}
 
 	if added > 0 {
-		log.Printf("import : %d nouveau(x) fichier(s)", added)
-		a.wake()
+		log.Printf("import : %d fichier(s) chiffré(s)", added)
 	}
 	a.imp.mu.Lock()
 	a.imp.lastScan = time.Now()
@@ -137,45 +149,97 @@ func (a *App) scanImports() {
 	a.imp.mu.Unlock()
 }
 
-// importFile indexe un fichier du dossier d'import ; false si c'est un doublon.
-func (a *App) importFile(ownerID int64, path, rel, kind, mime string, size int64, mtime time.Time) (bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	h := sha256.New()
-	_, err = io.Copy(h, f)
-	f.Close()
-	if err != nil {
-		return false, err
-	}
-	sum := hex.EncodeToString(h.Sum(nil))
-
-	var existing int64
-	err = a.db.QueryRow(`SELECT id FROM assets WHERE owner_id=? AND sha256=?`, ownerID, sum).Scan(&existing)
-	if err == nil {
-		return false, nil
-	}
-
-	taken := quickTakenAt(path, mime)
+// importFile chiffre un fichier du dossier d'import pour la clé publique du compte, puis l'efface.
+func (a *App) importFile(u importUser, path, kind, mime string, info fs.FileInfo) error {
+	m := a.probe(path, kind, mime)
+	taken := m.taken
 	if taken.IsZero() {
-		taken = wallClock(mtime)
+		taken = wallClock(info.ModTime())
 	}
-	name := filepath.Base(path)
-	_, err = a.db.Exec(`INSERT INTO assets(owner_id, kind, filename, path, mime, size, sha256, device_key, taken_at, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`, ownerID, kind, name, rel, mime, size, sum,
-		fmt.Sprintf("%s|%d", strings.ToLower(name), size), taken.UnixMilli(), time.Now().UnixMilli())
+
+	fk := randomBytes(KeySize)
+	sealedFK, err := SealToPublic(u.pub, fk)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
-			return false, nil
-		}
-		return false, err
+		return err
 	}
-	return true, nil
+	meta, _ := json.Marshal(Meta{Name: filepath.Base(path), Mime: mime, Width: m.width, Height: m.height, Duration: m.duration, Size: info.Size()})
+	encSize := StreamSize(info.Size())
+	res, err := a.db.Exec(`INSERT INTO assets(owner_id, kind, taken_at, wrapped_fk, fk_sealed, meta, orig_size, created_at)
+		VALUES (?,?,?,?,1,?,?,?)`, u.id, kind, taken.UnixMilli(), sealedFK, Seal(fk, meta, AADMeta), encSize, time.Now().UnixMilli())
+	if err != nil {
+		return err
+	}
+	id, _ := res.LastInsertId()
+	a.writeAssetFiles(id)
+	fail := func(err error) error {
+		a.purge([]purgeItem{{u.id, id}})
+		return err
+	}
+
+	// original chiffré
+	if err := a.encryptFileTo(path, fk, a.blobPath(u.id, id, "o")); err != nil {
+		return fail(err)
+	}
+
+	// miniatures : générées en clair dans .tmp, chiffrées, effacées
+	// sur le disque de la VM (PrivateTmp), pas sur le partage : rien en clair de plus côté Freebox
+	tmp, err := os.MkdirTemp("", "pellicule-imp-*")
+	if err != nil {
+		return fail(err)
+	}
+	defer os.RemoveAll(tmp)
+	small, preview := filepath.Join(tmp, "s.jpg"), filepath.Join(tmp, "m.jpg")
+	hasThumb, hasPreview := false, false
+	if err := a.makeThumbs(path, kind, small, preview); err != nil {
+		log.Printf("miniature de %s : %v", filepath.Base(path), err)
+	}
+	if b, err := os.ReadFile(small); err == nil && len(b) > 0 {
+		hasThumb = writeFileAtomic(a.blobPath(u.id, id, "s"), Seal(fk, b, AADThumb)) == nil
+	}
+	if b, err := os.ReadFile(preview); err == nil && len(b) > 0 {
+		hasPreview = writeFileAtomic(a.blobPath(u.id, id, "m"), Seal(fk, b, AADPreview)) == nil
+	}
+
+	if _, err := a.db.Exec(`UPDATE assets SET uploaded=orig_size, complete=1, has_thumb=?, has_preview=? WHERE id=?`, hasThumb, hasPreview, id); err != nil {
+		return fail(err)
+	}
+	// le fichier en clair n'a plus rien à faire sur le partage
+	if err := os.Remove(path); err != nil {
+		log.Printf("import : impossible d'effacer %s : %v", path, err)
+	}
+	return nil
 }
 
-func isImported(rel string) bool {
-	return strings.HasPrefix(filepath.ToSlash(rel), importDir+"/")
+func (a *App) encryptFileTo(src string, fk []byte, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	// le fichier a pu être remplacé par un lien entre le parcours et l'ouverture
+	if st, err := in.Stat(); err != nil || !st.Mode().IsRegular() {
+		return errors.New("pas un fichier ordinaire")
+	}
+	if lst, err := os.Lstat(src); err != nil || !lst.Mode().IsRegular() {
+		return errors.New("pas un fichier ordinaire")
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	tmp := dst + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	err = EncryptStream(fk, in, out)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("chiffrement : %w", err)
+	}
+	return os.Rename(tmp, dst)
 }
 
 func (a *App) handleImportScan(w http.ResponseWriter, r *http.Request, u *User) {
@@ -193,13 +257,11 @@ func (a *App) importStatus(u *User) map[string]any {
 	if !a.imp.lastScan.IsZero() {
 		last = a.imp.lastScan.UnixMilli()
 	}
-	var count int64
-	a.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE owner_id=? AND path LIKE ?`, u.ID, importDir+"/"+u.Username+"/%").Scan(&count)
 	return map[string]any{
 		"folder":   filepath.Base(a.libDir) + "/" + a.importRel(u.Username),
 		"lastScan": last,
 		"running":  a.imp.running,
-		"count":    count,
+		"lastNew":  a.imp.lastNew,
 	}
 }
 

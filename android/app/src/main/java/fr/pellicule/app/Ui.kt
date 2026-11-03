@@ -11,6 +11,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.webkit.CookieManager
+import android.webkit.WebStorage
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
@@ -50,6 +51,10 @@ fun Activity.field(hint: String, type: Int = InputType.TYPE_CLASS_TEXT) = EditTe
     this.hint = hint
     inputType = type
     isSingleLine = true
+    // isSingleLine remplace la transformation : sans ceci, les mots de passe s'afficheraient en clair
+    if (type and InputType.TYPE_MASK_VARIATION == InputType.TYPE_TEXT_VARIATION_PASSWORD) {
+        transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
+    }
     textSize = 16f
     typeface = Typeface.DEFAULT // sinon Android met une police à chasse fixe sur les mots de passe
     setTextColor(color(R.color.text))
@@ -87,12 +92,15 @@ fun View.padForSystemBars(extra: Int = 0) {
     }
 }
 
-/** Déconnexion : coupe la sauvegarde, oublie la session, retour à l'écran de connexion. */
+/** Déconnexion : coupe la sauvegarde, détruit les clés de l'appareil (Keystore) et la clé maître, retour à l'appairage. */
 fun Activity.logoutPellicule() {
     Backup.cancel(this)
-    Prefs(this).token = ""
+    Keys.forget(this)
+    Videos.clear()
+    Prefs(this).fingerprint = ""
     CookieManager.getInstance().removeAllCookies(null)
+    WebStorage.getInstance().deleteAllData() // IndexedDB de la page (clés non extractibles, mais autant tout effacer)
     UploadedDb(this).clear()
-    startActivity(Intent(this, SetupActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
+    startActivity(Intent(this, PairActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
     finish()
 }

@@ -33,10 +33,12 @@ if [ -f "$UNIT" ] && confirm "Pellicule est déjà installé. Mettre à jour le 
   sleep 2
   systemctl is-active --quiet pellicule && echo "OK, Pellicule est à jour et tourne." \
     || { journalctl -u pellicule -n 20 --no-pager; die "le service ne démarre pas"; }
+  # compte pas encore créé : on réaffiche le QR code d'installation
+  runuser -u pellicule -- /usr/local/bin/pellicule -data /var/lib/pellicule setup-qr "https://$(hostname -I | awk '{print $1}'):$PORT" || true
   exit 0
 fi
 
-say "1/5 Paquets (libvips pour les miniatures et le HEIC, ffmpeg pour les vidéos)"
+say "1/5 Paquets (libvips et ffmpeg : miniatures des fichiers déposés par FolderSync)"
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libvips-tools ffmpeg cifs-utils ca-certificates
 
@@ -66,17 +68,30 @@ if confirm "Stocker les photos sur le disque dur de la Freebox (recommandé) ?";
   mountpoint -q "$MNT" && umount "$MNT"
 
   OPTS="credentials=/etc/pellicule/smb.cred,uid=pellicule,gid=pellicule,file_mode=0640,dir_mode=0750,iocharset=utf8"
+  # le plus sûr d'abord : SMB 3 chiffré (seal), puis SMB 3, 2.1, 2.0 ; SMB 1 seulement si on l'accepte
   VERS=""
-  for v in 3.0 2.1 2.0 1.0; do
+  for v in 3.0,seal 3.0 2.1 2.0; do
     if mount -t cifs "//$HOST/$SHARE" "$MNT" -o "$OPTS,vers=$v" 2>/dev/null; then VERS=$v; break; fi
   done
+  if [ -z "$VERS" ] && mount -t cifs "//$HOST/$SHARE" "$MNT" -o "$OPTS,vers=1.0" 2>/dev/null; then
+    umount "$MNT"
+    echo
+    echo "Le partage ne fonctionne qu'avec SMB 1, un vieux protocole peu sûr (les photos restent chiffrées)."
+    echo "Si Freebox OS propose SMB 2 ou 3, active-le et relance plutôt l'installation."
+    if confirm "Utiliser SMB 1 quand même ?"; then
+      mount -t cifs "//$HOST/$SHARE" "$MNT" -o "$OPTS,vers=1.0" && VERS=1.0
+    else
+      die "installation arrêtée : active SMB 2 ou 3 sur la Freebox"
+    fi
+  fi
   [ -n "$VERS" ] || die "impossible de monter //$HOST/$SHARE. Vérifie que le partage Windows est activé, le nom du partage, l'utilisateur et le mot de passe."
   echo "Partage monté (SMB $VERS)."
+  VERS_OPT="vers=$VERS"
 
   # montage automatique au démarrage (les espaces s'écrivent \040 dans fstab)
   sed -i "\# $MNT cifs #d" /etc/fstab
   ESC_SHARE="$(printf '%s' "$SHARE" | sed 's/ /\\040/g')"
-  echo "//$HOST/$ESC_SHARE $MNT cifs $OPTS,vers=$VERS,_netdev,nofail 0 0" >> /etc/fstab
+  echo "//$HOST/$ESC_SHARE $MNT cifs $OPTS,${VERS_OPT},_netdev,nofail 0 0" >> /etc/fstab
   systemctl daemon-reload
 
   SUB="$(ask 'Dossier des photos sur le disque' 'Pellicule')"
@@ -89,6 +104,19 @@ mkdir -p "$LIB"
 touch "$LIB/.pellicule-library"
 [ "$SMB" = 1 ] || chown -R pellicule:pellicule "$LIB"
 runuser -u pellicule -- test -w "$LIB" || die "l'utilisateur pellicule ne peut pas écrire dans $LIB"
+
+# VM réinstallée (ancienne perdue) : chaque photo a son fichier de clé sur le disque, chaque compte son
+# compte.json. « pellicule rebuild » affiche les comptes trouvés et ne reconstruit que si l'on tape RECONSTRUIRE.
+if [ ! -f /var/lib/pellicule/pellicule.db ] && ls "$LIB"/u*/compte.json >/dev/null 2>&1; then
+  echo
+  echo "Ce disque contient déjà des photos Pellicule (la VM a été réinstallée ?)."
+  if runuser -u pellicule -- /usr/local/bin/pellicule -data /var/lib/pellicule -library "$LIB" rebuild < /dev/tty; then
+    RESTORED=1
+  else
+    rm -f /var/lib/pellicule/pellicule.db /var/lib/pellicule/pellicule.db-wal /var/lib/pellicule/pellicule.db-shm
+    die "reconstruction annulée : rien n'a été modifié sur le disque des photos. Relance sudo ./install.sh pour recommencer."
+  fi
+fi
 
 say "4/5 Service systemd"
 cat > "$UNIT" <<EOF
@@ -112,10 +140,27 @@ Restart=always
 RestartSec=15
 Nice=5
 MemoryMax=450M
+UMask=0077
+# confinement : le service n'écrit que dans sa base et dans le dossier des photos
 NoNewPrivileges=yes
-ProtectSystem=full
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pellicule "$LIB"
 ProtectHome=yes
 PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
@@ -129,15 +174,51 @@ if ! systemctl is-active --quiet pellicule; then
 fi
 
 IP="$(hostname -I | awk '{print $1}')"
+P() { runuser -u pellicule -- /usr/local/bin/pellicule -data /var/lib/pellicule "$@"; }
 say "5/5 Terminé !"
+if [ "${RESTORED:-0}" = 1 ]; then
 cat <<EOF
 
-  Ouvre  http://$IP:$PORT  depuis un téléphone ou un PC de la maison,
-  puis crée le compte administrateur.
+  Pellicule est reconstruit : comptes, photos et albums sont revenus, mais les mots de passe NON.
+  Chaque personne reprend son compte avec SA CLÉ DE SECOURS (notée à la création du compte) :
+    1. dans l'app : « Appairer de nouveau » (ou « Scanner le QR code ») et vise celui-ci :
 
-  Photos :       $LIB
-  Base :         /var/lib/pellicule/pellicule.db  (à sauvegarder de temps en temps)
-  Journaux :     journalctl -u pellicule -f
-  Redémarrer :   systemctl restart pellicule
+EOF
+P login-qr "https://$IP:$PORT" || true
+cat <<EOF
+
+    2. touche « Mot de passe oublié / serveur réinstallé » ;
+    3. saisis ton nom, ta clé de secours, puis un nouveau mot de passe.
+
+  Sans clé de secours, les photos de ce compte restent illisibles : personne ne peut les récupérer.
+
+  Ce QR code se réaffiche avec :  sudo -u pellicule pellicule -data /var/lib/pellicule login-qr https://$IP:$PORT
+
+EOF
+exit 0
+fi
+cat <<EOF
+
+  Il reste une seule chose à faire, sur ton téléphone Android :
+    1. installe l'app (fichier pellicule-android-*.apk de ce dossier) ;
+    2. ouvre-la, touche « Scanner le QR code » et vise celui-ci :
+
+EOF
+P setup-qr "https://$IP:$PORT" || true
+cat <<EOF
+
+    3. choisis ton nom et ton mot de passe, puis NOTE LA CLÉ DE SECOURS affichée, sur papier.
+
+  LA RÈGLE : la clé de secours est le seul moyen de retrouver les photos si le mot de passe est oublié
+  OU si cette VM est perdue. Personne ne peut la retrouver, pas même l'administrateur. Chaque personne
+  invitée reçoit la sienne : dis-leur de la noter.
+
+  C'est tout : les photos du téléphone partent toutes seules, chiffrées, dès qu'il est sur le Wi-Fi.
+  Pour ajouter quelqu'un : dans l'app, Réglages → « Inviter quelqu'un ».
+
+  Ce QR code se réaffiche en relançant :  sudo ./install.sh   (puis « O »)
+  Photos (chiffrées) : $LIB
+  Base : /var/lib/pellicule/pellicule.db (si la VM est perdue : sudo ./install.sh la reconstruit depuis le disque)
+  Journaux : journalctl -u pellicule -f
 
 EOF

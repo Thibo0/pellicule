@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Le serveur est sur le réseau local, souvent en HTTP simple. -->
+<!-- Pellicule 0.5 : HTTPS uniquement. Le certificat auto-signé du serveur est accepté par empreinte
+     épinglée (voir Keys.PinnedTrust et MainActivity.onReceivedSslError), jamais par une autorité. -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="true" />
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
 </network-security-config>

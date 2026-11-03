@@ -10,9 +10,15 @@ class Prefs(ctx: Context) {
         get() = sp.getString("server", "")!!
         set(v) = sp.edit().putString("server", v).apply()
 
-    var token: String
-        get() = sp.getString("token", "")!!
-        set(v) = sp.edit().putString("token", v).apply()
+    /** Empreinte SHA-256 (hex) du certificat du serveur, épinglée à l'appairage. */
+    var fingerprint: String
+        get() = sp.getString("fingerprint", "")!!
+        set(v) = sp.edit().putString("fingerprint", v).apply()
+
+    /** Clé maître du compte, chiffrée par une clé du Keystore (voir Keys). */
+    var wrappedMK: String
+        get() = sp.getString("wrappedMK", "")!!
+        set(v) = sp.edit().putString("wrappedMK", v).commit().let { }
 
     var username: String
         get() = sp.getString("username", "")!!
@@ -52,9 +58,16 @@ class Prefs(ctx: Context) {
         get() = sp.getInt("progressTotal", 0)
         set(v) = sp.edit().putInt("progressTotal", v).apply()
 
+    /** Date d'installation de l'APK dont les données web ont été nettoyées (voir MainActivity.cleanOldWebData). */
+    var webDataFor: Long
+        get() = sp.getLong("webDataFor", 0)
+        set(v) = sp.edit().putLong("webDataFor", v).commit().let { }
+
     var askedPermissions: Boolean
         get() = sp.getBoolean("askedPermissions", false)
         set(v) = sp.edit().putBoolean("askedPermissions", v).apply()
 
-    val configured get() = server.isNotEmpty() && token.isNotEmpty()
+    /** Appairé (clé d'appareil acceptée par le serveur) et déverrouillé (clé maître présente). */
+    val paired get() = server.isNotEmpty() && fingerprint.isNotEmpty() && Keys.hasDeviceKey()
+    val configured get() = paired && wrappedMK.isNotEmpty()
 }

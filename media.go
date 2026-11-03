@@ -161,7 +161,7 @@ func (a *App) probe(path, kind, mime string) meta {
 		if a.tools.ffprobe == "" {
 			return m
 		}
-		out, err := run(time.Minute, a.tools.ffprobe, "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path)
+		out, err := run(time.Minute, a.tools.ffprobe, "-v", "quiet", "-protocol_whitelist", "file", "-print_format", "json", "-show_format", "-show_streams", path)
 		if err != nil {
 			return m
 		}
@@ -275,15 +275,9 @@ const (
 	previewSize = 1600 // côté max, pour la visionneuse
 )
 
-func (a *App) thumbPath(id int64, variant string) string {
-	return filepath.Join(a.thumbDir, fmt.Sprintf("%02x", id%256), fmt.Sprintf("%d_%s.jpg", id, variant))
-}
-
-func (a *App) makeThumbs(id int64, src, kind string) error {
-	small, preview := a.thumbPath(id, "s"), a.thumbPath(id, "m")
-	if err := os.MkdirAll(filepath.Dir(small), 0o755); err != nil {
-		return err
-	}
+// makeThumbs écrit la miniature carrée et l'aperçu en JPEG (en clair, dans un dossier temporaire :
+// l'import les chiffre aussitôt puis les efface).
+func (a *App) makeThumbs(src, kind, small, preview string) error {
 
 	if kind == "video" {
 		if a.tools.ffmpeg == "" {
@@ -291,7 +285,7 @@ func (a *App) makeThumbs(id int64, src, kind string) error {
 		}
 		var err error
 		for _, at := range []string{"1", "0"} {
-			_, err = run(3*time.Minute, a.tools.ffmpeg, "-v", "error", "-y", "-ss", at, "-i", src, "-frames:v", "1",
+			_, err = run(3*time.Minute, a.tools.ffmpeg, "-v", "error", "-y", "-protocol_whitelist", "file", "-ss", at, "-i", src, "-frames:v", "1",
 				"-vf", fmt.Sprintf("scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease", previewSize, previewSize),
 				"-q:v", "4", preview)
 			if err == nil {

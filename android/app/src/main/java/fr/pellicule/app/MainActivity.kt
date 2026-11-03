@@ -2,22 +2,22 @@ package fr.pellicule.app
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.DownloadManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.provider.Settings
-import android.webkit.CookieManager
+import android.net.http.SslError
+import android.webkit.ClientCertRequest
 import android.webkit.JavascriptInterface
-import android.webkit.URLUtil
+import android.webkit.SslErrorHandler
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -29,11 +29,21 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.lifecycleScope
+import androidx.webkit.ServiceWorkerClientCompat
+import androidx.webkit.ServiceWorkerControllerCompat
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URLDecoder
 
-/** La galerie est l'interface web de Pellicule, affichée dans une WebView ; le reste est natif. */
+/**
+ * La galerie est l'interface web de Pellicule, affichée dans une WebView ; le reste est natif.
+ * Les fichiers de l'interface viennent de l'APK, pas du serveur (voir WebAssets).
+ */
 class MainActivity : ComponentActivity() {
     private lateinit var web: WebView
     private lateinit var prefs: Prefs
@@ -62,17 +72,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
         if (!prefs.configured) {
-            startActivity(Intent(this, SetupActivity::class.java))
+            startActivity(Intent(this, PairActivity::class.java))
             finish()
             return
         }
         enableEdgeToEdge()
-
-        CookieManager.getInstance().apply {
-            setAcceptCookie(true)
-            setCookie(prefs.server, "pellicule_session=${prefs.token}; Path=/")
-            flush()
-        }
+        cleanOldWebData()
 
         web = WebView(this).apply {
             setBackgroundColor(color(R.color.bg))
@@ -83,8 +88,9 @@ class MainActivity : ComponentActivity() {
             addJavascriptInterface(Bridge(this@MainActivity), "PelliculeAndroid")
             webViewClient = Client()
             webChromeClient = Chrome()
-            setDownloadListener { url, _, disposition, mime, _ -> download(url, disposition, mime) }
         }
+        exposeMasterKey()
+        interceptServiceWorkers()
         // le padding d'une WebView ne décale pas la page : on décale un conteneur
         setContentView(FrameLayout(this).apply {
             setBackgroundColor(color(R.color.bg))
@@ -132,6 +138,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Échec passager (réseau, certificat non présenté) : on réessaie sans rien effacer. */
+    fun reloadLater() {
+        web.postDelayed({ web.clearSslPreferences(); web.reload() }, 3000)
+    }
+
     fun notifyWeb() {
         if (::web.isInitialized) web.post { web.evaluateJavascript("dispatchEvent(new Event('pellicule:native'))", null) }
     }
@@ -153,61 +164,123 @@ class MainActivity : ComponentActivity() {
         askPerms.launch(missing.toTypedArray())
     }
 
+    /**
+     * Ceinture de sécurité (la vraie protection est le profil WebView neuf de PelliculeApp, Android 9 et plus) :
+     * après une installation ou une mise à jour de l'APK, on efface les données web (caches, service worker,
+     * stockage). La clé maître n'y est pas indispensable : la page la redemande à l'app (exposeMasterKey).
+     */
+    private fun cleanOldWebData() {
+        val installed = runCatching { packageManager.getPackageInfo(packageName, 0).lastUpdateTime }.getOrDefault(0L)
+        if (installed == 0L || prefs.webDataFor == installed) return
+        android.webkit.WebStorage.getInstance().deleteAllData()
+        WebView(this).apply { clearCache(true); destroy() }
+        prefs.webDataFor = installed
+    }
+
+    /** Un service worker d'une ancienne version passe par ici : mêmes règles que la page (WebAssets). */
+    private fun interceptServiceWorkers() {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.SERVICE_WORKER_BASIC_USAGE) ||
+            !WebViewFeature.isFeatureSupported(WebViewFeature.SERVICE_WORKER_SHOULD_INTERCEPT_REQUEST)) return
+        ServiceWorkerControllerCompat.getInstance().setServiceWorkerClient(object : ServiceWorkerClientCompat() {
+            override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? =
+                WebAssets.intercept(this@MainActivity, prefs, request, ::isOurs)
+        })
+    }
+
     private fun isOurs(uri: Uri): Boolean {
         val base = Uri.parse(prefs.server)
         return uri.scheme == base.scheme && uri.host == base.host && uri.port == base.port
     }
 
-    /** Le serveur a pu renouveler la session (connexion depuis la page web) : on la récupère pour la sauvegarde. */
-    private fun syncToken() {
-        val cookie = CookieManager.getInstance().getCookie(prefs.server) ?: return
-        val token = Regex("pellicule_session=([0-9a-f]+)").find(cookie)?.groupValues?.get(1) ?: return
-        if (token != prefs.token) prefs.token = token
+    /**
+     * La page (vault.js) a besoin de la clé maître pour déchiffrer. Elle la demande par un canal de messages
+     * que la WebView ne crée que pour l'origine exacte du serveur épinglé : une autre page ne le voit pas.
+     * Tout document de cette origine vient de l'APK (WebAssets : le serveur ne peut fournir ni la page, ni ses
+     * scripts, ni un autre document) : la clé ne va qu'au code embarqué dans l'app.
+     */
+    private fun exposeMasterKey() {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) return
+        WebViewCompat.addWebMessageListener(web, "PelliculeKeys", setOf(prefs.server)) { _, msg, origin, isMainFrame, reply ->
+            if (!isMainFrame || origin.toString().trimEnd('/') != prefs.server || msg.data != "mk") return@addWebMessageListener
+            val mk = Keys.masterKey(this) ?: return@addWebMessageListener reply.postMessage("")
+            try { reply.postMessage(Crypto.b64(mk)) } finally { mk.fill(0) }
+        }
     }
 
-    private fun download(url: String, disposition: String?, mime: String?) {
-        val name = disposition?.let { Regex("filename\\*=UTF-8''([^;]+)").find(it)?.groupValues?.get(1) }
-            ?.let { URLDecoder.decode(it, "UTF-8") }
-            ?: URLUtil.guessFileName(url, disposition, mime)
-        enqueueDownload(url, name)
-        Toast.makeText(this, "Téléchargement de $name…", Toast.LENGTH_SHORT).show()
+    /** Originaux téléchargés par l'app : récupérés chiffrés, déchiffrés ici, rangés dans Images/Pellicule. */
+    fun downloadDecrypted(items: List<Triple<String, ByteArray, Pair<String, String>>>) {
+        Toast.makeText(this, "Téléchargement de ${items.size} élément(s)…", Toast.LENGTH_SHORT).show()
+        lifecycleScope.launch {
+            var ok = 0
+            var err = ""
+            withContext(Dispatchers.IO) {
+                val api = Api.of(prefs)
+                for ((url, fk, nm) in items) {
+                    try {
+                        Downloads.save(this@MainActivity, api, url, fk, nm.first, nm.second)
+                        ok++
+                    } catch (e: Exception) {
+                        err = e.message ?: e.javaClass.simpleName
+                    } finally {
+                        fk.fill(0)
+                    }
+                }
+            }
+            Toast.makeText(this@MainActivity,
+                if (err.isEmpty()) "$ok élément(s) enregistré(s) → Galerie, album « Pellicule »" else "$ok enregistré(s), erreur : $err",
+                Toast.LENGTH_LONG).show()
+        }
     }
 
-    /** Photos et vidéos vont dans Images/Pellicule (visibles dans la galerie), le reste (ZIP…) dans Téléchargements. */
-    fun enqueueDownload(url: String, name: String) {
-        val media = Regex("\\.(jpe?g|png|gif|webp|heic|heif|avif|tiff?|dng|mp4|m4v|mov|webm|3gp|mkv|avi|mts)$", RegexOption.IGNORE_CASE)
-            .containsMatchIn(name)
-        val req = DownloadManager.Request(Uri.parse(url))
-            .addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
-            .setTitle(name)
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-        if (media) req.setDestinationInExternalPublicDir(Environment.DIRECTORY_PICTURES, "Pellicule/$name")
-        else req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
-        getSystemService(DownloadManager::class.java).enqueue(req)
-    }
-
-    private fun offlinePage(reason: String) = """
+    private fun offlinePage(reason: String, title: String = "Serveur injoignable", hint: String = "Pellicule n'est accessible que depuis le Wi-Fi de la maison.", repair: Boolean = false) = """
         <!doctype html><html lang="fr"><meta name="viewport" content="width=device-width,initial-scale=1">
         <style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:90vh;margin:0;padding:24px;
         background:#f7f4ef;color:#1f1b17;text-align:center}@media(prefers-color-scheme:dark){body{background:#161412;color:#f1ece6}}
         a{display:inline-block;margin-top:18px;padding:12px 22px;border-radius:99px;background:#d9692a;color:#fff;text-decoration:none;font-weight:600}
         p{opacity:.7;max-width:320px}</style>
-        <div><h2>Serveur injoignable</h2><p>Pellicule n'est accessible que depuis le Wi-Fi de la maison.</p>
-        <p style="font-size:13px">${prefs.server} — $reason</p><a href="${prefs.server}/">Réessayer</a></div></html>
+        <div><h2>$title</h2><p>$hint</p>
+        <p style="font-size:13px">${prefs.server} — $reason</p><a href="${prefs.server}/">Réessayer</a>${if (repair) """<br><a href="pellicule-app:repair" style="background:transparent;color:inherit;border:1px solid currentColor">Appairer de nouveau</a>""" else ""}</div></html>
     """.trimIndent()
 
     private inner class Client : WebViewClient() {
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+            // bouton de la page « Ce n'est pas ton serveur » (page locale) : on oublie ce serveur et on repart de l'accueil
+            if (request.url.toString() == "pellicule-app:repair") { logoutPellicule(); return true }
             if (isOurs(request.url)) return false
             runCatching { startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
             return true
         }
 
-        override fun onPageFinished(view: WebView, url: String) = syncToken()
+        /** Interface servie depuis l'APK, vidéos déchiffrées ici, seules les requêtes /api/ partent au serveur (WebAssets). */
+        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
+            WebAssets.intercept(this@MainActivity, prefs, request, ::isOurs)
+
+        /** Certificat auto-signé du serveur : accepté seulement s'il a l'empreinte épinglée à l'appairage. */
+        override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
+            val fp = Keys.fingerprint(error.certificate)
+            if (fp != null && fp == prefs.fingerprint && isOurs(Uri.parse(error.url))) {
+                handler.proceed()
+            } else {
+                handler.cancel()
+                view.loadDataWithBaseURL(null, offlinePage("certificat inattendu : connexion refusée.", "Ce n'est pas ton serveur",
+                    "Le serveur ne présente pas le certificat enregistré à l'appairage : quelqu'un se fait peut-être passer pour lui. " +
+                    "Ne touche « Appairer de nouveau » que si le serveur vient d'être réinstallé ou restauré, et scanne alors " +
+                    "le QR code affiché sur la VM. Sinon, n'en fais rien et préviens la personne qui s'occupe du serveur.", repair = true), "text/html", "utf-8", null)
+            }
+        }
+
+        /** Le serveur demande un certificat client : la clé de l'appareil (Keystore) répond, pour notre serveur seulement. */
+        override fun onReceivedClientCertRequest(view: WebView, request: ClientCertRequest) {
+            val base = Uri.parse(prefs.server)
+            if (request.host != base.host || request.port != base.port || !Keys.hasDeviceKey()) return request.ignore()
+            runCatching { Keys.clientCredentials() }
+                .onSuccess { (key, chain) -> request.proceed(key, chain) }
+                .onFailure { request.ignore() }
+        }
 
         override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
             if (request.isForMainFrame) {
-                view.loadDataWithBaseURL(prefs.server + "/", offlinePage(error.description.toString()), "text/html", "utf-8", null)
+                view.loadDataWithBaseURL(null, offlinePage(error.description.toString()), "text/html", "utf-8", null)
             }
         }
     }
@@ -244,11 +317,32 @@ class Bridge(private val act: MainActivity) {
         .put("progressTotal", prefs.progressTotal)
         .toString()
 
+    /** Empreinte épinglée à l'appairage (QR codes d'invitation créés dans l'app). */
+    @JavascriptInterface
+    fun fingerprint(): String = prefs.fingerprint
+
     @JavascriptInterface
     fun setViewer(open: Boolean) = act.runOnUiThread { act.setViewerMode(open) }
 
     @JavascriptInterface
     fun logout() = act.runOnUiThread { act.logoutPellicule() }
+
+    /** La page ne voit pas d'utilisateur : on vérifie par notre propre connexion mTLS avant d'effacer les clés. */
+    @JavascriptInterface
+    fun checkRevoked() {
+        Thread {
+            val r = Api.of(prefs).reach()
+            act.runOnUiThread {
+                when (r) {
+                    Api.Reach.REVOKED -> {
+                        Toast.makeText(act, "Ce téléphone a été révoqué : ses clés sont effacées. Appaire-le de nouveau.", Toast.LENGTH_LONG).show()
+                        act.logoutPellicule()
+                    }
+                    else -> act.reloadLater()
+                }
+            }
+        }.start()
+    }
 
     @JavascriptInterface
     fun setEnabled(on: Boolean) {
@@ -259,22 +353,28 @@ class Bridge(private val act: MainActivity) {
     @JavascriptInterface
     fun backupNow() = Backup.runNow(act)
 
-    /** Télécharge des originaux dans la galerie du téléphone : [{"url": "...", "name": "..."}]. */
+    /** Télécharge des originaux dans la galerie : [{"url", "fk" (clé du fichier), "name", "mime"}]. */
     @JavascriptInterface
     fun download(itemsJson: String) {
         val arr = JSONArray(itemsJson)
         val base = Uri.parse(prefs.server)
-        var n = 0
-        for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
+        val items = (0 until arr.length()).map { arr.getJSONObject(it) }.mapNotNull { o ->
             val url = Uri.parse(o.getString("url"))
-            if (url.host != base.host || url.port != base.port) continue // uniquement depuis notre serveur
-            act.enqueueDownload(url.toString(), o.getString("name").substringAfterLast('/'))
-            n++
+            // uniquement des originaux de notre serveur
+            if (url.scheme != "https" || url.host != base.host || url.port != base.port || url.path?.endsWith("/original") != true) null
+            else Triple(url.toString(), Crypto.unb64(o.getString("fk")), o.getString("name").substringAfterLast('/') to o.optString("mime"))
         }
-        act.runOnUiThread {
-            Toast.makeText(act, "$n élément(s) en téléchargement → Galerie, album « Pellicule »", Toast.LENGTH_LONG).show()
-        }
+        if (items.isNotEmpty()) act.runOnUiThread { act.downloadDecrypted(items) }
+    }
+
+    /** Vidéo à lire : la page confie sa clé à l'app, qui la déchiffrera par plages. */
+    @JavascriptInterface
+    fun registerVideo(key: String, json: String) {
+        val o = JSONObject(json)
+        val url = Uri.parse(o.getString("url"))
+        val base = Uri.parse(prefs.server)
+        if (url.scheme != "https" || url.host != base.host || url.port != base.port || url.path?.endsWith("/original") != true) return
+        Videos.register(key, url.toString(), Crypto.unb64(o.getString("fk")), o.optString("mime"), o.getLong("plainSize"), o.getLong("encSize"))
     }
 
     @JavascriptInterface

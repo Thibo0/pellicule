@@ -8,6 +8,7 @@
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -15,6 +16,7 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
+        android:name=".PelliculeApp"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="Pellicule"
@@ -31,7 +33,7 @@
             </intent-filter>
         </activity>
         <activity
-            android:name=".SetupActivity"
+            android:name=".PairActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
         <activity

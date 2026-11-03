@@ -372,3 +372,28 @@ label.lbl { display: block; font-size: 13px; color: var(--muted); margin: 14px 0
   .share-wrap { padding: 0 2px 80px; }
   .share-head { padding: 20px 14px 4px; }
 }
+
+/* --- 0.5 : coffre chiffré --- */
+.tile .ph { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 6px; color: var(--muted); padding: 8px; text-align: center; }
+.tile .ph svg { width: 26px; height: 26px; }
+.tile .ph small { font-size: 11px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tile.noimg img { display: none; }
+.viewer .vmsg { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 10px; color: #ddd; text-align: center; padding: 24px; }
+.viewer .vmsg svg { width: 32px; height: 32px; }
+.hint { font-size: 13px; color: var(--muted); }
+.auth-card .hint { margin-top: 10px; }
+.auth-card .btn + .btn { margin-top: 10px; }
+.auth-card .link { display: block; text-align: center; margin-top: 14px; font-size: 14px; color: var(--muted); }
+.auth-card .switch { margin-top: 16px; }
+.recovery { font: 600 15px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .04em; word-break: break-all;
+  background: var(--accent-soft); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin: 16px 0 4px; user-select: all; }
+.recovery .rg { display: inline-block; margin: 0 6px 4px 0; white-space: nowrap; }
+.recovery .rg small { opacity: .55; font-weight: 400; margin-right: 2px; }
+h2.rules { font-size: 15px; margin: 18px 0 6px; }
+ul.rules { margin: 0 0 14px; padding-left: 20px; font-size: 14px; line-height: 1.5; }
+ul.rules li { margin-bottom: 6px; }
+.auth-card .form-row .btn { width: auto; height: 38px; margin-top: 8px; }
+code, .fp { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12.5px; word-break: break-all; }
+.qr { display: grid; place-items: center; margin: 14px 0; }
+.qr svg { width: min(280px, 70vw); height: auto; background: #fff; padding: 10px; border-radius: 12px; }
+.code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; }

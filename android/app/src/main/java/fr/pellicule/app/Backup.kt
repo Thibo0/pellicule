@@ -105,22 +105,35 @@ class BackupWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             prefs.lastResult = "accès aux photos non autorisé"
             return
         }
-        when (Api.reach(prefs.server, prefs.token)) {
+        val api = Api.of(prefs)
+        when (api.reach()) {
             Api.Reach.UNREACHABLE -> { prefs.lastResult = "serveur injoignable (hors de la maison ?)"; return }
-            Api.Reach.UNAUTHORIZED -> { prefs.lastResult = "session expirée : reconnecte-toi dans les réglages"; return }
+            Api.Reach.REVOKED -> { prefs.lastResult = "ce téléphone n'est plus appairé : appaire-le de nouveau"; return }
+            Api.Reach.BAD_CERT -> { prefs.lastResult = "le serveur présente un autre certificat que celui appairé : sauvegarde bloquée"; return }
             Api.Reach.OK -> {}
         }
+        val mk = Keys.masterKey(ctx) ?: run { prefs.lastResult = "clé de chiffrement absente : appaire de nouveau ce téléphone"; return }
+        try {
+            send(ctx, api, mk)
+        } finally {
+            mk.fill(0)
+        }
+    }
 
+    private suspend fun send(ctx: Context, api: Api, mk: ByteArray) {
+        val up = Uploader(ctx, api, mk)
         val db = UploadedDb(ctx)
         val done = db.doneIds()
         var todo = Media.toBackup(ctx, prefs).filter { done[it.id] != it.size }
 
-        // ce qui est déjà sur le serveur (envoyé à la main, par FolderSync…) n'est pas renvoyé
+        // ce qui est déjà sur le serveur (envoyé depuis le navigateur…) n'est pas renvoyé ; le serveur ne voit
+        // que des HMAC du nom et de la taille, pas les noms
         if (todo.isNotEmpty()) {
+            val tags = todo.associateWith { up.deviceTag(it) }
             val existing = HashSet<String>()
-            todo.chunked(500).forEach { existing += Api.check(prefs.server, prefs.token, it.map { m -> m.key }) }
-            todo.filter { it.key in existing }.forEach { db.mark(it) }
-            todo = todo.filter { it.key !in existing }
+            todo.chunked(500).forEach { part -> existing += api.check(part.map { tags.getValue(it) }) }
+            todo.filter { tags.getValue(it) in existing }.forEach { db.mark(it) }
+            todo = todo.filter { tags.getValue(it) !in existing }
         }
         if (todo.isEmpty()) {
             prefs.lastResult = "tout est sauvegardé"
@@ -137,21 +150,16 @@ class BackupWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             prefs.progressDone = i
             if (foreground) tryForeground("Sauvegarde ${i + 1} / ${todo.size}", i, todo.size)
             try {
-                var uri = item.uri
-                if (Build.VERSION.SDK_INT >= 29 && Media.canReadLocation(ctx)) {
-                    uri = MediaStore.setRequireOriginal(uri) // garde la position GPS dans le fichier
-                }
-                val input = ctx.contentResolver.openInputStream(uri) ?: throw IOException("fichier illisible")
-                input.use { Api.upload(prefs.server, prefs.token, item, it) }
+                up.upload(item)
                 db.mark(item)
                 sent++
             } catch (e: Exception) {
-                if (e is ConnectException || e is SocketTimeoutException || e is NoRouteToHostException) {
-                    lastError = "connexion perdue"
-                    break // plus de réseau / sorti de la maison : on reprendra plus tard
+                if (e is ConnectException || e is SocketTimeoutException || e is NoRouteToHostException || e is Api.BadCertificate) {
+                    lastError = if (e is Api.BadCertificate) "certificat du serveur inattendu" else "connexion perdue"
+                    break // plus de réseau / sorti de la maison : on reprendra plus tard, là où l'envoi s'est arrêté
                 }
-                if (e is Api.HttpError && e.code == 401) {
-                    lastError = "session expirée"
+                if (e is Api.HttpError && (e.code == 401 || e.code == 403)) {
+                    lastError = "téléphone révoqué"
                     break
                 }
                 errors++

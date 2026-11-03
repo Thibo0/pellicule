@@ -19,10 +19,7 @@ data class MediaItem(
     val size: Long,
     val dateMs: Long,
     val bucket: String,
-) {
-    /** Même clé que côté serveur pour repérer ce qui est déjà sauvegardé. */
-    val key get() = "$name|$size"
-}
+)
 
 /** Lecture des photos et vidéos du téléphone via MediaStore. */
 object Media {

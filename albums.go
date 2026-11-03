@@ -1,18 +1,26 @@
 package main
 
+// Albums et liens de partage.
+//
+// Le nom d'un album est chiffré par la clé maître du propriétaire. Un lien de partage porte sa propre
+// clé dans le fragment de l'URL (/s/<jeton>#<clé>), que le navigateur n'envoie jamais au serveur :
+// pour chaque photo partagée, le client dépose ici la clé du fichier chiffrée par cette clé de partage.
+// Le serveur connaît donc le jeton (pour retrouver l'album) mais ne peut rien déchiffrer.
+
 import (
 	"database/sql"
 	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 )
 
 type Album struct {
 	ID        int64  `json:"id"`
-	Name      string `json:"name"`
+	Name      []byte `json:"name"` // chiffré
 	CoverID   *int64 `json:"coverId"`
+	CoverFK   []byte `json:"coverFk,omitempty"`
+	CoverSeal bool   `json:"coverSealed,omitempty"` // clé de la couverture encore scellée par l'import
 	Count     int    `json:"count"`
 	StartAt   *int64 `json:"startAt"`
 	EndAt     *int64 `json:"endAt"`
@@ -21,20 +29,20 @@ type Album struct {
 }
 
 // La couverture par défaut est la photo la plus récente de l'album.
-const albumSelect = `SELECT al.id, al.name,
-	COALESCE(al.cover_asset_id, (SELECT x.id FROM album_assets aa JOIN assets x ON x.id=aa.asset_id
-		WHERE aa.album_id=al.id AND x.trashed_at IS NULL ORDER BY x.taken_at DESC LIMIT 1)),
-	(SELECT COUNT(*) FROM album_assets aa JOIN assets x ON x.id=aa.asset_id WHERE aa.album_id=al.id AND x.trashed_at IS NULL),
-	(SELECT MIN(x.taken_at) FROM album_assets aa JOIN assets x ON x.id=aa.asset_id WHERE aa.album_id=al.id AND x.trashed_at IS NULL),
-	(SELECT MAX(x.taken_at) FROM album_assets aa JOIN assets x ON x.id=aa.asset_id WHERE aa.album_id=al.id AND x.trashed_at IS NULL),
+const albumSelect = `SELECT al.id, al.name, c.id, c.wrapped_fk, COALESCE(c.fk_sealed, 0),
+	(SELECT COUNT(*) FROM album_assets aa JOIN assets x ON x.id=aa.asset_id WHERE aa.album_id=al.id AND x.trashed_at IS NULL AND x.complete=1),
+	(SELECT MIN(x.taken_at) FROM album_assets aa JOIN assets x ON x.id=aa.asset_id WHERE aa.album_id=al.id AND x.trashed_at IS NULL AND x.complete=1),
+	(SELECT MAX(x.taken_at) FROM album_assets aa JOIN assets x ON x.id=aa.asset_id WHERE aa.album_id=al.id AND x.trashed_at IS NULL AND x.complete=1),
 	al.updated_at,
 	EXISTS(SELECT 1 FROM shares s WHERE s.album_id=al.id)
-	FROM albums al`
+	FROM albums al
+	LEFT JOIN assets c ON c.id = COALESCE(al.cover_asset_id, (SELECT x.id FROM album_assets aa JOIN assets x ON x.id=aa.asset_id
+		WHERE aa.album_id=al.id AND x.trashed_at IS NULL AND x.complete=1 ORDER BY x.taken_at DESC LIMIT 1))`
 
 func scanAlbum(s scanner) (Album, error) {
 	var al Album
 	var cover, start, end sql.NullInt64
-	err := s.Scan(&al.ID, &al.Name, &cover, &al.Count, &start, &end, &al.UpdatedAt, &al.Shared)
+	err := s.Scan(&al.ID, &al.Name, &cover, &al.CoverFK, &al.CoverSeal, &al.Count, &start, &end, &al.UpdatedAt, &al.Shared)
 	if cover.Valid {
 		al.CoverID = &cover.Int64
 	}
@@ -53,8 +61,10 @@ func (a *App) ownedAlbum(u *User, id int64) (Album, error) {
 
 func (a *App) albumAssets(albumID int64) ([]Asset, error) {
 	return queryAssets(a.db, `SELECT `+assetCols+` FROM album_assets aa JOIN assets a ON a.id=aa.asset_id
-		WHERE aa.album_id=? AND a.trashed_at IS NULL ORDER BY a.taken_at DESC, a.id DESC`, albumID)
+		WHERE aa.album_id=? AND a.trashed_at IS NULL AND a.complete=1 ORDER BY a.taken_at DESC, a.id DESC`, albumID)
 }
+
+func validName(name []byte) bool { return len(name) >= NonceSize+TagSize && len(name) <= 4096 }
 
 func (a *App) handleAlbums(w http.ResponseWriter, r *http.Request, u *User) {
 	rows, err := a.db.Query(albumSelect+` WHERE al.owner_id=? ORDER BY al.updated_at DESC`, u.ID)
@@ -77,24 +87,24 @@ func (a *App) handleAlbums(w http.ResponseWriter, r *http.Request, u *User) {
 
 func (a *App) handleCreateAlbum(w http.ResponseWriter, r *http.Request, u *User) {
 	var body struct {
-		Name string  `json:"name"`
+		Name []byte  `json:"name"`
 		IDs  []int64 `json:"ids"`
 	}
 	if !readJSON(w, r, &body) {
 		return
 	}
-	name := strings.TrimSpace(body.Name)
-	if name == "" || len(name) > 200 {
-		httpError(w, http.StatusBadRequest, "nom d'album invalide")
+	if !validName(body.Name) || len(body.IDs) > 20000 {
+		httpError(w, http.StatusBadRequest, "requête invalide")
 		return
 	}
 	now := time.Now().UnixMilli()
-	res, err := a.db.Exec(`INSERT INTO albums(owner_id, name, created_at, updated_at) VALUES (?,?,?,?)`, u.ID, name, now, now)
+	res, err := a.db.Exec(`INSERT INTO albums(owner_id, name, created_at, updated_at) VALUES (?,?,?,?)`, u.ID, body.Name, now, now)
 	if err != nil {
 		serverError(w, err)
 		return
 	}
 	id, _ := res.LastInsertId()
+	a.writeAlbumsFile(u.ID)
 	if len(body.IDs) > 0 {
 		if err := a.addToAlbum(u, id, body.IDs); err != nil {
 			serverError(w, err)
@@ -132,20 +142,26 @@ func (a *App) handleUpdateAlbum(w http.ResponseWriter, r *http.Request, u *User)
 		return
 	}
 	var body struct {
-		Name    *string `json:"name"`
-		CoverID *int64  `json:"coverId"`
+		Name    []byte `json:"name"`
+		CoverID *int64 `json:"coverId"`
+		// noms re-chiffrés pour chaque lien de partage existant (sinon le lien garderait l'ancien nom)
+		ShareNames map[string][]byte `json:"shareNames"`
 	}
 	if !readJSON(w, r, &body) {
 		return
 	}
 	now := time.Now().UnixMilli()
 	if body.Name != nil {
-		name := strings.TrimSpace(*body.Name)
-		if name == "" || len(name) > 200 {
+		if !validName(body.Name) {
 			httpError(w, http.StatusBadRequest, "nom d'album invalide")
 			return
 		}
-		a.db.Exec(`UPDATE albums SET name=?, updated_at=? WHERE id=?`, name, now, id)
+		a.db.Exec(`UPDATE albums SET name=?, updated_at=? WHERE id=?`, body.Name, now, id)
+		for sid, n := range body.ShareNames {
+			if validName(n) {
+				a.db.Exec(`UPDATE shares SET name=? WHERE id=? AND album_id=?`, n, sid, id)
+			}
+		}
 	}
 	if body.CoverID != nil {
 		var n int
@@ -156,6 +172,7 @@ func (a *App) handleUpdateAlbum(w http.ResponseWriter, r *http.Request, u *User)
 		}
 		a.db.Exec(`UPDATE albums SET cover_asset_id=?, updated_at=? WHERE id=?`, *body.CoverID, now, id)
 	}
+	a.writeAlbumsFile(u.ID)
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -164,8 +181,11 @@ func (a *App) handleDeleteAlbum(w http.ResponseWriter, r *http.Request, u *User)
 	if !ok {
 		return
 	}
-	// Supprimer un album ne supprime pas les photos.
-	a.db.Exec(`DELETE FROM albums WHERE id=? AND owner_id=?`, id, u.ID)
+	if err := mustExec(a.db, `DELETE FROM albums WHERE id=? AND owner_id=?`, id, u.ID); err != nil { // les photos restent
+		serverError(w, err)
+		return
+	}
+	a.writeAlbumsFile(u.ID)
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -177,6 +197,7 @@ func (a *App) addToAlbum(u *User, albumID int64, ids []int64) error {
 	if err == nil {
 		a.db.Exec(`UPDATE albums SET updated_at=? WHERE id=?`, now, albumID)
 	}
+	a.writeAlbumsFile(u.ID)
 	return err
 }
 
@@ -214,37 +235,37 @@ func (a *App) handleAlbumRemove(w http.ResponseWriter, r *http.Request, u *User)
 		return
 	}
 	ph, args := placeholders(ids)
-	a.db.Exec(`DELETE FROM album_assets WHERE album_id=? AND asset_id IN (`+ph+`)`, append([]any{id}, args...)...)
-	a.db.Exec(`UPDATE albums SET cover_asset_id=NULL WHERE id=? AND cover_asset_id IN (`+ph+`)`, append([]any{id}, args...)...)
-	a.db.Exec(`UPDATE albums SET updated_at=? WHERE id=?`, time.Now().UnixMilli(), id)
-	writeJSON(w, map[string]any{"ok": true})
-}
-
-func (a *App) handleAlbumZip(w http.ResponseWriter, r *http.Request, u *User) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
-	}
-	al, err := a.ownedAlbum(u, id)
-	if err != nil {
-		httpError(w, http.StatusNotFound, "album introuvable")
-		return
-	}
-	items, err := a.albumAssets(id)
+	with := append([]any{id}, args...)
+	err := a.inTx(func(tx *sql.Tx) error {
+		if err := mustExec(tx, `DELETE FROM album_assets WHERE album_id=? AND asset_id IN (`+ph+`)`, with...); err != nil {
+			return err
+		}
+		// la clé de partage d'une photo retirée de l'album est détruite : le lien ne peut plus l'ouvrir
+		if err := mustExec(tx, `DELETE FROM share_keys WHERE share_id IN (SELECT id FROM shares WHERE album_id=?) AND asset_id IN (`+ph+`)`, with...); err != nil {
+			return err
+		}
+		if err := mustExec(tx, `UPDATE albums SET cover_asset_id=NULL WHERE id=? AND cover_asset_id IN (`+ph+`)`, with...); err != nil {
+			return err
+		}
+		return mustExec(tx, `UPDATE albums SET updated_at=? WHERE id=?`, time.Now().UnixMilli(), id)
+	})
 	if err != nil {
 		serverError(w, err)
 		return
 	}
-	a.writeZip(w, al.Name, items)
+	a.writeAlbumsFile(u.ID)
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 // --- liens de partage ---
 
 type Share struct {
-	Token         string `json:"token"`
+	ID            int64  `json:"id"`
+	Link          []byte `json:"link"` // chiffré par la clé maître : seul le propriétaire peut réafficher le lien
 	AllowDownload bool   `json:"allowDownload"`
 	CreatedAt     int64  `json:"createdAt"`
 	ExpiresAt     *int64 `json:"expiresAt"`
+	Missing       int    `json:"missing"` // photos de l'album dont la clé n'a pas encore été déposée
 }
 
 func (a *App) handleAlbumShares(w http.ResponseWriter, r *http.Request, u *User) {
@@ -256,7 +277,11 @@ func (a *App) handleAlbumShares(w http.ResponseWriter, r *http.Request, u *User)
 		httpError(w, http.StatusNotFound, "album introuvable")
 		return
 	}
-	rows, err := a.db.Query(`SELECT token, allow_download, created_at, expires_at FROM shares WHERE album_id=? ORDER BY created_at DESC`, id)
+	rows, err := a.db.Query(`SELECT s.id, s.link, s.allow_download, s.created_at, s.expires_at,
+		(SELECT COUNT(*) FROM album_assets aa JOIN assets x ON x.id=aa.asset_id
+			WHERE aa.album_id=s.album_id AND x.complete=1 AND x.trashed_at IS NULL
+			AND NOT EXISTS(SELECT 1 FROM share_keys k WHERE k.share_id=s.id AND k.asset_id=aa.asset_id))
+		FROM shares s WHERE s.album_id=? ORDER BY s.created_at DESC`, id)
 	if err != nil {
 		serverError(w, err)
 		return
@@ -266,13 +291,18 @@ func (a *App) handleAlbumShares(w http.ResponseWriter, r *http.Request, u *User)
 	for rows.Next() {
 		var s Share
 		var exp sql.NullInt64
-		rows.Scan(&s.Token, &s.AllowDownload, &s.CreatedAt, &exp)
+		rows.Scan(&s.ID, &s.Link, &s.AllowDownload, &s.CreatedAt, &exp, &s.Missing)
 		if exp.Valid {
 			s.ExpiresAt = &exp.Int64
 		}
 		out = append(out, s)
 	}
 	writeJSON(w, out)
+}
+
+type shareKey struct {
+	Asset int64  `json:"asset"`
+	FK    []byte `json:"fk"`
 }
 
 func (a *App) handleCreateShare(w http.ResponseWriter, r *http.Request, u *User) {
@@ -285,67 +315,156 @@ func (a *App) handleCreateShare(w http.ResponseWriter, r *http.Request, u *User)
 		return
 	}
 	var body struct {
-		AllowDownload bool `json:"allowDownload"`
-		Days          int  `json:"days"` // 0 = sans expiration
+		Token         string     `json:"token"` // choisi par le client (il fait partie du lien qu'il chiffre)
+		Link          []byte     `json:"link"`
+		Name          []byte     `json:"name"`
+		Keys          []shareKey `json:"keys"`
+		AllowDownload bool       `json:"allowDownload"`
+		Days          int        `json:"days"` // 0 = sans expiration
 	}
 	if !readJSON(w, r, &body) {
 		return
 	}
-	token := randomToken(16)
+	if len(body.Token) < 32 || len(body.Token) > 128 || !validName(body.Link) || !validName(body.Name) {
+		httpError(w, http.StatusBadRequest, "requête invalide")
+		return
+	}
+	if body.Days < 0 || body.Days > 3650 {
+		httpError(w, http.StatusBadRequest, "durée invalide (0 à 3650 jours)")
+		return
+	}
 	var exp any
 	if body.Days > 0 {
 		exp = time.Now().Add(time.Duration(body.Days) * 24 * time.Hour).UnixMilli()
 	}
-	_, err := a.db.Exec(`INSERT INTO shares(token, album_id, allow_download, created_at, expires_at) VALUES (?,?,?,?,?)`,
-		token, id, body.AllowDownload, time.Now().UnixMilli(), exp)
+	var sid int64
+	err := a.inTx(func(tx *sql.Tx) error {
+		res, err := tx.Exec(`INSERT INTO shares(token, album_id, link, name, allow_download, created_at, expires_at) VALUES (?,?,?,?,?,?,?)`,
+			tokenHash(body.Token), id, body.Link, body.Name, body.AllowDownload, time.Now().UnixMilli(), exp)
+		if err != nil {
+			return err
+		}
+		sid, _ = res.LastInsertId()
+		_, err = storeShareKeys(tx, sid, id, body.Keys)
+		return err
+	})
 	if err != nil {
 		serverError(w, err)
 		return
 	}
-	writeJSON(w, map[string]any{"token": token})
+	writeJSON(w, map[string]any{"id": sid})
+}
+
+// storeShareKeys n'accepte que des photos qui sont réellement dans l'album partagé.
+func storeShareKeys(db execer, shareID, albumID int64, keys []shareKey) (int, error) {
+	n := 0
+	for _, k := range keys {
+		if len(k.FK) != boxSize {
+			continue
+		}
+		res, err := db.Exec(`INSERT OR REPLACE INTO share_keys(share_id, asset_id, wrapped_fk)
+			SELECT ?, ?, ? WHERE EXISTS(SELECT 1 FROM album_assets WHERE album_id=? AND asset_id=?)`,
+			shareID, k.Asset, k.FK, albumID, k.Asset)
+		if err != nil {
+			return n, err
+		}
+		c, _ := res.RowsAffected()
+		n += int(c)
+	}
+	return n, nil
+}
+
+// handleShareKeys : après un ajout de photos dans un album partagé, le client dépose leurs clés.
+func (a *App) handleShareKeys(w http.ResponseWriter, r *http.Request, u *User) {
+	sid, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var albumID int64
+	if a.db.QueryRow(`SELECT s.album_id FROM shares s JOIN albums al ON al.id=s.album_id WHERE s.id=? AND al.owner_id=?`, sid, u.ID).Scan(&albumID) != nil {
+		httpError(w, http.StatusNotFound, "lien introuvable")
+		return
+	}
+	var body struct {
+		Keys []shareKey `json:"keys"`
+	}
+	if !readJSON(w, r, &body) {
+		return
+	}
+	var n int
+	err := a.inTx(func(tx *sql.Tx) (err error) {
+		n, err = storeShareKeys(tx, sid, albumID, body.Keys)
+		return err
+	})
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"stored": n})
 }
 
 func (a *App) handleDeleteShare(w http.ResponseWriter, r *http.Request, u *User) {
-	a.db.Exec(`DELETE FROM shares WHERE token=? AND album_id IN (SELECT id FROM albums WHERE owner_id=?)`, r.PathValue("token"), u.ID)
+	sid, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if err := mustExec(a.db, `DELETE FROM shares WHERE id=? AND album_id IN (SELECT id FROM albums WHERE owner_id=?)`, sid, u.ID); err != nil {
+		serverError(w, err)
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
-// publicShare valide un jeton de partage et renvoie l'album associé.
-func (a *App) publicShare(token string) (Album, bool, error) {
-	var albumID int64
-	var allow bool
+// --- accès public par lien ---
+
+type publicShare struct {
+	id, albumID, owner int64
+	name               []byte
+	allow              bool
+}
+
+func (a *App) publicShare(token string) (publicShare, error) {
+	var s publicShare
 	var exp sql.NullInt64
-	err := a.db.QueryRow(`SELECT album_id, allow_download, expires_at FROM shares WHERE token=?`, token).Scan(&albumID, &allow, &exp)
+	err := a.db.QueryRow(`SELECT s.id, s.album_id, al.owner_id, s.name, s.allow_download, s.expires_at
+		FROM shares s JOIN albums al ON al.id=s.album_id WHERE s.token=?`, tokenHash(token)).
+		Scan(&s.id, &s.albumID, &s.owner, &s.name, &s.allow, &exp)
 	if err != nil {
-		return Album{}, false, err
+		return s, err
 	}
 	if exp.Valid && exp.Int64 < time.Now().UnixMilli() {
-		return Album{}, false, errors.New("lien expiré")
+		return s, errors.New("lien expiré")
 	}
-	al, err := scanAlbum(a.db.QueryRow(albumSelect+` WHERE al.id=?`, albumID))
-	return al, allow, err
+	return s, nil
+}
+
+// sharedAssets : les photos de l'album, avec la clé de fichier chiffrée pour ce lien (et non pour le propriétaire).
+func (a *App) sharedAssets(s publicShare) ([]Asset, error) {
+	items, err := queryAssets(a.db, `SELECT a.id, a.kind, a.taken_at, k.wrapped_fk, 0, a.meta, a.orig_size, a.has_thumb, a.has_preview, 0, NULL
+		FROM album_assets aa JOIN assets a ON a.id=aa.asset_id JOIN share_keys k ON k.asset_id=a.id AND k.share_id=?
+		WHERE aa.album_id=? AND a.trashed_at IS NULL AND a.complete=1 ORDER BY a.taken_at DESC, a.id DESC`, s.id, s.albumID)
+	return items, err
 }
 
 func (a *App) handlePublicAlbum(w http.ResponseWriter, r *http.Request) {
-	al, allow, err := a.publicShare(r.PathValue("token"))
+	s, err := a.publicShare(r.PathValue("token"))
 	if err != nil {
 		httpError(w, http.StatusNotFound, "lien invalide ou expiré")
 		return
 	}
-	items, err := a.albumAssets(al.ID)
+	items, err := a.sharedAssets(s)
 	if err != nil {
 		serverError(w, err)
 		return
 	}
 	var owner string
-	a.db.QueryRow(`SELECT u.username FROM albums al JOIN users u ON u.id=al.owner_id WHERE al.id=?`, al.ID).Scan(&owner)
-	al.Shared = false
-	writeJSON(w, map[string]any{"album": al, "items": items, "allowDownload": allow, "owner": owner})
+	a.db.QueryRow(`SELECT username FROM users WHERE id=?`, s.owner).Scan(&owner)
+	writeJSON(w, map[string]any{"name": s.name, "items": items, "allowDownload": s.allow, "owner": owner})
 }
 
 func (a *App) servePublic(variant string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		al, allow, err := a.publicShare(r.PathValue("token"))
+		s, err := a.publicShare(r.PathValue("token"))
 		if err != nil {
 			httpError(w, http.StatusNotFound, "lien invalide ou expiré")
 			return
@@ -355,31 +474,19 @@ func (a *App) servePublic(variant string) http.HandlerFunc {
 			httpError(w, http.StatusBadRequest, "identifiant invalide")
 			return
 		}
-		as, err := scanAsset(a.db.QueryRow(`SELECT `+assetCols+` FROM album_assets aa JOIN assets a ON a.id=aa.asset_id
-			WHERE aa.album_id=? AND a.id=? AND a.trashed_at IS NULL`, al.ID, id))
+		var kind string
+		err = a.db.QueryRow(`SELECT a.kind FROM album_assets aa JOIN assets a ON a.id=aa.asset_id
+			JOIN share_keys k ON k.asset_id=a.id AND k.share_id=?
+			WHERE aa.album_id=? AND a.id=? AND a.trashed_at IS NULL AND a.complete=1`, s.id, s.albumID, id).Scan(&kind)
 		if err != nil {
 			httpError(w, http.StatusNotFound, "introuvable")
 			return
 		}
-		// les vidéos se lisent depuis l'original : autorisé même sans téléchargement
-		a.serveAsset(w, r, as, variant, allow || (as.Kind == "video" && r.URL.Query().Get("download") != "1"))
+		// l'original n'est servi que si le téléchargement est permis ; les vidéos se lisent depuis l'original
+		if variant == "o" && !s.allow && kind != "video" {
+			httpError(w, http.StatusForbidden, "téléchargement désactivé")
+			return
+		}
+		a.serveBlob(w, r, s.owner, id, variant)
 	}
-}
-
-func (a *App) handlePublicZip(w http.ResponseWriter, r *http.Request) {
-	al, allow, err := a.publicShare(r.PathValue("token"))
-	if err != nil {
-		httpError(w, http.StatusNotFound, "lien invalide ou expiré")
-		return
-	}
-	if !allow {
-		httpError(w, http.StatusForbidden, "téléchargement désactivé")
-		return
-	}
-	items, err := a.albumAssets(al.ID)
-	if err != nil {
-		serverError(w, err)
-		return
-	}
-	a.writeZip(w, al.Name, items)
 }
