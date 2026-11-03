@@ -110,6 +110,11 @@ CREATE TABLE IF NOT EXISTS import_seen (
   size INTEGER NOT NULL,
   mtime INTEGER NOT NULL
 );
+-- import commencé mais pas terminé : si le serveur plante dessus (mémoire…), le fichier est mis de côté
+CREATE TABLE IF NOT EXISTS import_running (
+  path TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value BLOB NOT NULL

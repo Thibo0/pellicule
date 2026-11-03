@@ -21,7 +21,13 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # libvips et ffmpeg réels : vérifie les protections contre les fichiers piégés (import_safety_test.go)
+      - name: Outils de décodage
+        run: sudo apt-get update -q && sudo apt-get install -y -q libvips-tools ffmpeg
+
       - name: Serveur (go vet, go test)
+        env:
+          PELLICULE_OUTILS: "1"
         run: |
           test -z "$(gofmt -l *.go)" || { gofmt -l *.go; echo "fichiers non formatés (gofmt)"; exit 1; }
           go vet ./...

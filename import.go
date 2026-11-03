@@ -128,7 +128,22 @@ func (a *App) scanImports() {
 				os.Remove(p)
 				return nil
 			}
-			if err := a.importFile(u, p, kind, mime, info); err != nil {
+			if !signatureOK(p) {
+				a.refuseImport(root, p, rel, "le contenu ne correspond pas à l'extension")
+				return nil
+			}
+			// fichier poison : un import interrompu deux fois (plantage, mémoire épuisée) n'est pas retenté
+			var attempts int
+			a.db.QueryRow(`SELECT attempts FROM import_running WHERE path=?`, rel).Scan(&attempts)
+			if attempts >= maxImportAttempts {
+				a.refuseImport(root, p, rel, "le serveur s'est arrêté pendant son traitement")
+				return nil
+			}
+			a.db.Exec(`INSERT INTO import_running(path, attempts) VALUES (?,1)
+				ON CONFLICT(path) DO UPDATE SET attempts=attempts+1`, rel)
+			err = a.importFile(u, p, kind, mime, info)
+			a.db.Exec(`DELETE FROM import_running WHERE path=?`, rel)
+			if err != nil {
 				log.Printf("import de %s : %v", rel, err)
 				return nil
 			}
@@ -147,6 +162,39 @@ func (a *App) scanImports() {
 	a.imp.lastNew = added
 	a.imp.running = false
 	a.imp.mu.Unlock()
+}
+
+// refusedDir : sous-dossier caché (ignoré par le parcours) où sont mis de côté les fichiers refusés,
+// pour que le propriétaire les retrouve sur le partage au lieu qu'ils soient retentés sans fin.
+const refusedDir = ".refusés"
+
+// 2 et non 1 : un arrêt normal du service (mise à jour) pendant un import ne doit pas suffire à refuser le fichier
+const maxImportAttempts = 2
+
+func (a *App) refuseImport(root, path, rel, why string) {
+	dir := filepath.Join(root, refusedDir)
+	os.MkdirAll(dir, 0o755)
+	base := filepath.Base(path)
+	dst := filepath.Join(dir, base)
+	for i := 2; ; i++ {
+		if _, err := os.Lstat(dst); errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+		ext := filepath.Ext(base)
+		dst = filepath.Join(dir, fmt.Sprintf("%s (%d)%s", strings.TrimSuffix(base, ext), i, ext))
+	}
+	if err := os.Rename(path, dst); err != nil {
+		log.Printf("import : %s refusé (%s), impossible de le déplacer : %v", rel, why, err)
+		return
+	}
+	a.db.Exec(`DELETE FROM import_running WHERE path=?`, rel)
+	log.Printf("import : %s refusé (%s), déplacé dans %s", rel, why, refusedDir)
+}
+
+// refusedCount : nombre de fichiers mis de côté pour ce compte (affiché dans l'app).
+func (a *App) refusedCount(username string) int {
+	entries, _ := os.ReadDir(filepath.Join(a.libDir, importDir, username, refusedDir))
+	return len(entries)
 }
 
 // importFile chiffre un fichier du dossier d'import pour la clé publique du compte, puis l'efface.
@@ -262,6 +310,7 @@ func (a *App) importStatus(u *User) map[string]any {
 		"lastScan": last,
 		"running":  a.imp.running,
 		"lastNew":  a.imp.lastNew,
+		"refused":  a.refusedCount(u.Username),
 	}
 }
 

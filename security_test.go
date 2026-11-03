@@ -1133,7 +1133,7 @@ func TestPasDImportPourUnCompteNonRepris(t *testing.T) {
 	dir := filepath.Join(app.libDir, "Import", "alice")
 	os.MkdirAll(dir, 0o755)
 	f := filepath.Join(dir, "a.jpg")
-	os.WriteFile(f, []byte("pas vraiment une photo"), 0o644)
+	os.WriteFile(f, []byte("\xff\xd8\xff pas vraiment une photo"), 0o644)
 	old := time.Now().Add(-time.Hour)
 	os.Chtimes(f, old, old)
 	app.scanImports()

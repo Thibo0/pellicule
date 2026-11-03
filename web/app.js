@@ -1406,6 +1406,7 @@ function renderAutoStatus(imp) {
   const last = imp.running ? 'vérification en cours…'
     : imp.lastScan ? `dernière vérification à ${new Date(imp.lastScan).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}` : 'pas encore vérifié';
   st.innerHTML = `Dossier d’import : <b>${esc(imp.folder)}</b><br>${esc(plural(imp.count, 'élément importé', 'éléments importés'))} · ${esc(last)}
+    ${imp.refused ? `<br><b>⚠ ${esc(plural(imp.refused, 'fichier refusé', 'fichiers refusés'))}</b> (illisible ou pas une vraie photo/vidéo) : mis de côté dans le dossier caché <b>${esc(imp.folder)}/.refusés</b>, à vérifier puis supprimer.` : ''}
     <br><button class="btn" id="scan-now" style="margin-top:10px">${icon('restore')}Vérifier maintenant</button>`;
   $('#scan-now').onclick = async () => {
     await post('/api/import/scan', {});

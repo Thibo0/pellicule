@@ -40,6 +40,60 @@ func mediaType(name string) (kind, mime string, ok bool) {
 	return t[0], t[1], ok
 }
 
+// signatureOK : le contenu commence bien comme le format annoncé par l'extension. libvips et ffmpeg choisissent
+// leur décodeur d'après le contenu : sans ce contrôle, un faux .jpg déposé dans Import/ pourrait passer par un
+// décodeur exotique (ImageMagick, playlist HLS…) capable de lire d'autres fichiers de la machine.
+func signatureOK(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	h := make([]byte, 200)
+	n, _ := f.Read(h)
+	return headerMatches(strings.ToLower(filepath.Ext(path)), h[:n])
+}
+
+func headerMatches(ext string, h []byte) bool {
+	at := func(off int, s string) bool { return len(h) >= off+len(s) && string(h[off:off+len(s)]) == s }
+	// MP4, MOV, HEIC, AVIF… (ISO BMFF / QuickTime) : boîte « ftyp », ou boîte QuickTime ancienne en tête
+	isoBox := func() bool {
+		for _, b := range []string{"ftyp", "moov", "mdat", "wide", "free", "skip", "pnot"} {
+			if at(4, b) {
+				return true
+			}
+		}
+		return false
+	}
+	switch ext {
+	case ".jpg", ".jpeg":
+		return at(0, "\xff\xd8\xff")
+	case ".png":
+		return at(0, "\x89PNG\r\n\x1a\n")
+	case ".gif":
+		return at(0, "GIF87a") || at(0, "GIF89a")
+	case ".webp":
+		return at(0, "RIFF") && at(8, "WEBP")
+	case ".heic", ".heif", ".avif":
+		return at(4, "ftyp")
+	case ".tif", ".tiff", ".dng":
+		return at(0, "II*\x00") || at(0, "MM\x00*")
+	case ".mp4", ".m4v", ".mov", ".3gp":
+		return isoBox()
+	case ".webm", ".mkv":
+		return at(0, "\x1a\x45\xdf\xa3")
+	case ".avi":
+		return at(0, "RIFF") && at(8, "AVI ")
+	case ".mts":
+		// MPEG-TS (paquets de 188 octets) ou M2TS d'AVCHD (4 octets d'horodatage + 188)
+		return at(0, "G") && at(188, "G") || at(4, "G") && at(196, "G")
+	}
+	return false
+}
+
+// formats que ffmpeg et ffprobe ont le droit d'ouvrir (noms de démultiplexeurs) : pas de playlist HLS, concat…
+const videoFormats = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpegts"
+
 // wallClock convertit un instant en "heure murale" stockée comme UTC :
 // les dates EXIF n'ont pas de fuseau, on aligne tout le reste dessus.
 func wallClock(t time.Time) time.Time {
@@ -135,6 +189,8 @@ func run(timeout time.Duration, name string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
+	// libvips ≥ 8.13 : refuse les décodeurs non sûrs (ImageMagick, Matlab, FITS…) même si le contenu les désigne
+	cmd.Env = append(os.Environ(), "VIPS_BLOCK_UNTRUSTED=1")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -161,7 +217,7 @@ func (a *App) probe(path, kind, mime string) meta {
 		if a.tools.ffprobe == "" {
 			return m
 		}
-		out, err := run(time.Minute, a.tools.ffprobe, "-v", "quiet", "-protocol_whitelist", "file", "-print_format", "json", "-show_format", "-show_streams", path)
+		out, err := run(time.Minute, a.tools.ffprobe, "-v", "quiet", "-protocol_whitelist", "file", "-format_whitelist", videoFormats, "-print_format", "json", "-show_format", "-show_streams", path)
 		if err != nil {
 			return m
 		}
@@ -285,7 +341,7 @@ func (a *App) makeThumbs(src, kind, small, preview string) error {
 		}
 		var err error
 		for _, at := range []string{"1", "0"} {
-			_, err = run(3*time.Minute, a.tools.ffmpeg, "-v", "error", "-y", "-protocol_whitelist", "file", "-ss", at, "-i", src, "-frames:v", "1",
+			_, err = run(3*time.Minute, a.tools.ffmpeg, "-v", "error", "-y", "-protocol_whitelist", "file", "-format_whitelist", videoFormats, "-ss", at, "-i", src, "-frames:v", "1",
 				"-vf", fmt.Sprintf("scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease", previewSize, previewSize),
 				"-q:v", "4", preview)
 			if err == nil {
