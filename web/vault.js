@@ -46,13 +46,21 @@ const Vault = (() => {
   const loadKeys = () => idb('readonly', s => s.get('current')).catch(() => null);
   const clearKeys = () => idb('readwrite', s => s.delete('current')).catch(() => {});
 
+  // dans l'app Android, la clé maître vit dans le Keystore : la page ne la garde qu'en mémoire. Une CryptoKey
+  // « non extractible » rangée dans IndexedDB y est quand même écrite en clair dans le profil de la WebView.
+  const inApp = () => !!window.PelliculeKeys;
+
+  // le serveur retrouve un compte quelle que soit la casse saisie (« élodie » → « Élodie ») : pareil ici
+  const sameUser = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
+
   async function restore(username) {
-    if (keys?.username === username) return true;
-    const k = await loadKeys();
-    if (k && k.username === username && k.aes) { keys = k; return true; }
+    if (sameUser(keys?.username, username)) return true;
+    if (inApp()) await clearKeys(); // copie laissée par une version précédente
+    const k = inApp() ? null : await loadKeys();
+    if (k && sameUser(k.username, username) && k.aes) { keys = k; return true; }
     // dans l'app Android, la clé maître est gardée par le Keystore du téléphone ; elle passe par un canal
     // que l'app n'ouvre que pour l'origine exacte du serveur épinglé
-    if (window.PelliculeKeys) {
+    if (inApp()) {
       const mk = await new Promise(resolve => {
         window.PelliculeKeys.onmessage = e => resolve(e.data);
         window.PelliculeKeys.postMessage('mk');
@@ -81,7 +89,7 @@ const Vault = (() => {
     const priv = await PC.importPrivate(pkcs8);
     pkcs8.fill(0);
     keys = { username, ...mk, priv, pub: bytes(bundle.pub) };
-    await saveKeys(keys);
+    if (!inApp()) await saveKeys(keys);
   }
 
   async function openMasterKey(wrapKey, wrappedMK) {
@@ -168,8 +176,13 @@ const Vault = (() => {
     if (src.share) return PC.open(src.share.sk, box, PC.L.shareFk);
     if (a.sealed) {
       // clé scellée par l'import pour notre clé publique : on la rechiffre avec la clé maître
-      const fk = await PC.openFromPublic(keys.priv, keys.pub, box);
-      pendingRewrap.push({ id: a.id, fk: b64std(await PC.seal(keys.aes, fk, PC.L.fk)) });
+      // imports récents : clé (32) ‖ empreinte du contenu (32), pour que le client calcule le dedupTag
+      const opened = await PC.openFromPublic(keys.priv, keys.pub, box);
+      const fk = opened.slice(0, PC.KEY_SIZE);
+      const item = { id: a.id, fk: b64std(await PC.seal(keys.aes, fk, PC.L.fk)) };
+      if (opened.length === 2 * PC.KEY_SIZE) item.dedupTag = PC.toHex(await PC.dedupTag(keys, opened.slice(PC.KEY_SIZE)));
+      opened.fill(0);
+      pendingRewrap.push(item);
       clearTimeout(rewrapTimer);
       rewrapTimer = setTimeout(flushRewrap, 1500);
       return fk;
@@ -491,20 +504,24 @@ const Vault = (() => {
     const meta = { name: file.name, mime: mimeOf(file), size: file.size, w: th.w || 0, h: th.h || 0, dur: th.dur || 0 };
     const encSize = PC.streamSize(file.size);
 
-    const r = await req('/api/assets', { method: 'POST', body: {
+    const createBody = {
       kind, takenAt: taken, size: encSize, dedupTag, deviceTag: await deviceTagOf(file),
       fk: b64std(await PC.seal(keys.aes, fk, PC.L.fk)), meta: b64std(await PC.sealJSON(fkKey, meta, PC.L.meta)),
-    } });
+    };
+    const r = await req('/api/assets', { method: 'POST', body: createBody });
     if (r.status === 'duplicate') { onBytes(file.size); return 'duplicate'; }
-    const base = `/api/assets/${r.id}`;
-    if (th.thumb) await req(`${base}/thumb`, { method: 'PUT', raw: await PC.seal(fkKey, th.thumb, PC.L.thumb) });
-    if (th.preview) await req(`${base}/preview`, { method: 'PUT', raw: await PC.seal(fkKey, th.preview, PC.L.preview) });
+    let base = `/api/assets/${r.id}`;
+    const sendThumbs = async () => {
+      if (th.thumb) await req(`${base}/thumb`, { method: 'PUT', raw: await PC.seal(fkKey, th.thumb, PC.L.thumb) });
+      if (th.preview) await req(`${base}/preview`, { method: 'PUT', raw: await PC.seal(fkKey, th.preview, PC.L.preview) });
+    };
+    await sendThumbs();
 
     // flux chiffré, envoyé par morceaux à partir de ce que le serveur a déjà (reprise identique : clé dérivée du contenu)
     const hdr = PC.streamHeader(prefix);
     const full = PC.CHUNK_SIZE + PC.TAG_SIZE;
     const nChunks = Math.max(1, Math.ceil(file.size / PC.CHUNK_SIZE));
-    let uploaded = r.uploaded || 0;
+    let uploaded = r.uploaded || 0, conflicts = 0;
     let chunk = Math.max(0, Math.floor((uploaded - PC.STREAM_HDR) / full));
     onBytes(Math.min(file.size, chunk * PC.CHUNK_SIZE));
     while (uploaded < encSize) {
@@ -521,10 +538,13 @@ const Vault = (() => {
         uploaded = res.uploaded;
       } catch (e) {
         if (e.status !== 409) throw e;
-        const again = await req('/api/assets', { method: 'POST', body: { kind, takenAt: taken, size: encSize, dedupTag,
-          fk: b64std(await PC.seal(keys.aes, fk, PC.L.fk)), meta: b64std(await PC.sealJSON(fkKey, meta, PC.L.meta)) } });
+        // position refusée ou envoi encore en cours (requête précédente pas encore abandonnée par le serveur)
+        if (++conflicts > 20) throw new Error('envoi désynchronisé');
+        await new Promise(res => setTimeout(res, Math.min(10000, 500 * conflicts)));
+        const again = await req('/api/assets', { method: 'POST', body: createBody });
         if (again.status === 'duplicate') return 'duplicate';
-        uploaded = again.uploaded;
+        if (`/api/assets/${again.id}` !== base) { base = `/api/assets/${again.id}`; await sendThumbs(); } // envoi expiré, recréé
+        uploaded = again.uploaded || 0;
         chunk = Math.max(0, Math.floor((uploaded - PC.STREAM_HDR) / full));
         continue;
       }

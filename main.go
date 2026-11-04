@@ -33,6 +33,7 @@ type App struct {
 	certDER  []byte // le certificat lui-même (à installer dans les appareils de la maison)
 	secret   []byte // secret propre à l'installation (faux sels)
 	files    filesState
+	uploads  uploadLocks // envois d'originaux en cours (un à la fois par photo)
 }
 
 func env(key, def string) string {

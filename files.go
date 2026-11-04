@@ -18,6 +18,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -96,10 +97,70 @@ func (a *App) writeAccountFile(id int64) error {
 }
 
 // writeAssetFiles : après chaque création ou modification d'un élément (clé rechiffrée, favori, corbeille).
+// Au-delà de syncWriteMax éléments (sélection de toute une année…), l'écriture se fait en tâche de fond :
+// sur le partage de la Freebox, 20 000 petits fichiers prendraient bien plus que la durée d'une requête.
+// Si le service s'arrête avant la fin, la vérification du démarrage (syncFiles) termine le travail.
 func (a *App) writeAssetFiles(ids ...int64) {
+	if len(ids) > syncWriteMax {
+		a.files.later(a, ids)
+		return
+	}
 	for _, id := range ids {
 		a.syncAssetFile(id, false)
 	}
+}
+
+const syncWriteMax = 100
+
+// later ajoute des éléments à la file d'écriture ; un seul écrivain tourne à la fois.
+func (s *filesState) later(a *App, ids []int64) {
+	s.qmu.Lock()
+	if s.queue == nil {
+		s.queue = map[int64]struct{}{}
+	}
+	for _, id := range ids {
+		s.queue[id] = struct{}{}
+	}
+	start := !s.draining
+	s.draining = true
+	s.qmu.Unlock()
+	if start {
+		go s.drain(a)
+	}
+}
+
+func (s *filesState) drain(a *App) {
+	for {
+		s.qmu.Lock()
+		batch := make([]int64, 0, 200)
+		for id := range s.queue {
+			batch = append(batch, id)
+			delete(s.queue, id)
+			if len(batch) == cap(batch) {
+				break
+			}
+		}
+		if len(batch) == 0 {
+			s.draining = false
+			s.qmu.Unlock()
+			return
+		}
+		s.qmu.Unlock()
+		for _, id := range batch {
+			a.syncAssetFile(id, false)
+		}
+	}
+}
+
+// pendingWrites : éléments encore dans la file d'écriture (tests, Réglages).
+func (s *filesState) pendingWrites() int {
+	s.qmu.Lock()
+	defer s.qmu.Unlock()
+	n := len(s.queue)
+	if s.draining && n == 0 {
+		n = 1 // dernier lot en cours d'écriture
+	}
+	return n
 }
 
 // assetFileData : contenu attendu du fichier de clé (nil si l'élément n'existe plus).
@@ -127,6 +188,10 @@ func (a *App) assetFileData(id int64) (owner int64, data []byte, err error) {
 // syncAssetFile écrit le fichier de clé ; onlyIfDifferent : seulement s'il est absent ou différent de la base
 // (écriture ratée sur le partage, ou fichier modifié par quelqu'un qui a accès au partage). Renvoie true si écrit.
 func (a *App) syncAssetFile(id int64, onlyIfDifferent bool) bool {
+	// une écriture à la fois : la file de fond, les requêtes et la vérification quotidienne peuvent viser le
+	// même fichier, et chacune doit écrire l'état de la base lu juste avant (pas un état plus ancien)
+	a.files.wmu.Lock()
+	defer a.files.wmu.Unlock()
 	owner, data, err := a.assetFileData(id)
 	if err == nil && data == nil {
 		return false
@@ -202,10 +267,16 @@ func (a *App) writeAlbumsFile(owner int64) {
 type filesState struct {
 	last   atomic.Int64 // fin de la dernière vérification complète (ms), 0 = pas encore
 	failed atomic.Int64 // écritures ratées depuis le début de cette vérification
+
+	wmu      sync.Mutex // écriture d'un fichier de clé
+	qmu      sync.Mutex // file d'écriture en tâche de fond
+	queue    map[int64]struct{}
+	draining bool
 }
 
 func (a *App) filesStatus() map[string]any {
-	return map[string]any{"lastSync": a.files.last.Load(), "failed": a.files.failed.Load(), "oddNames": a.oddUsernames()}
+	return map[string]any{"lastSync": a.files.last.Load(), "failed": a.files.failed.Load(), "pending": a.files.pendingWrites(),
+		"oddNames": a.oddUsernames()}
 }
 
 // oddUsernames : comptes créés avant les règles actuelles (ils restent utilisables et reconstructibles ;

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -206,6 +207,7 @@ func (a *App) importFile(u importUser, path, kind, mime string, info fs.FileInfo
 	}
 
 	fk := randomBytes(KeySize)
+	// provisoire : remplacée une fois l'empreinte du contenu connue (voir plus bas)
 	sealedFK, err := SealToPublic(u.pub, fk)
 	if err != nil {
 		return err
@@ -225,7 +227,13 @@ func (a *App) importFile(u importUser, path, kind, mime string, info fs.FileInfo
 	}
 
 	// original chiffré
-	if err := a.encryptFileTo(path, fk, a.blobPath(u.id, id, "o")); err != nil {
+	hash, err := a.encryptFileTo(path, fk, a.blobPath(u.id, id, "o"))
+	if err != nil {
+		return fail(err)
+	}
+	// clé du fichier ‖ empreinte du contenu, scellées ensemble : le serveur ne connaît pas la clé de
+	// dédoublonnage (dérivée de la clé maître) ; c'est le client qui calcule le dedupTag au rechiffrement.
+	if sealedFK, err = SealToPublic(u.pub, append(append([]byte{}, fk...), hash...)); err != nil {
 		return fail(err)
 	}
 
@@ -248,9 +256,11 @@ func (a *App) importFile(u importUser, path, kind, mime string, info fs.FileInfo
 		hasPreview = writeFileAtomic(a.blobPath(u.id, id, "m"), Seal(fk, b, AADPreview)) == nil
 	}
 
-	if _, err := a.db.Exec(`UPDATE assets SET uploaded=orig_size, complete=1, has_thumb=?, has_preview=? WHERE id=?`, hasThumb, hasPreview, id); err != nil {
+	if _, err := a.db.Exec(`UPDATE assets SET wrapped_fk=?, uploaded=orig_size, complete=1, has_thumb=?, has_preview=? WHERE id=?`,
+		sealedFK, hasThumb, hasPreview, id); err != nil {
 		return fail(err)
 	}
+	a.writeAssetFiles(id)
 	// le fichier en clair n'a plus rien à faire sur le partage
 	if err := os.Remove(path); err != nil {
 		log.Printf("import : impossible d'effacer %s : %v", path, err)
@@ -258,36 +268,38 @@ func (a *App) importFile(u importUser, path, kind, mime string, info fs.FileInfo
 	return nil
 }
 
-func (a *App) encryptFileTo(src string, fk []byte, dst string) error {
+// encryptFileTo chiffre src dans dst et renvoie l'empreinte du contenu en clair (la même que celle des clients).
+func (a *App) encryptFileTo(src string, fk []byte, dst string) ([]byte, error) {
 	in, err := os.Open(src)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer in.Close()
 	// le fichier a pu être remplacé par un lien entre le parcours et l'ouverture
 	if st, err := in.Stat(); err != nil || !st.Mode().IsRegular() {
-		return errors.New("pas un fichier ordinaire")
+		return nil, errors.New("pas un fichier ordinaire")
 	}
 	if lst, err := os.Lstat(src); err != nil || !lst.Mode().IsRegular() {
-		return errors.New("pas un fichier ordinaire")
+		return nil, errors.New("pas un fichier ordinaire")
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
+		return nil, err
 	}
 	tmp := dst + ".tmp"
 	out, err := os.Create(tmp)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	err = EncryptStream(fk, in, out)
+	h := NewContentHasher()
+	err = EncryptStream(fk, io.TeeReader(in, h), out)
 	if cerr := out.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
 		os.Remove(tmp)
-		return fmt.Errorf("chiffrement : %w", err)
+		return nil, fmt.Errorf("chiffrement : %w", err)
 	}
-	return os.Rename(tmp, dst)
+	return h.Sum(), os.Rename(tmp, dst)
 }
 
 func (a *App) handleImportScan(w http.ResponseWriter, r *http.Request, u *User) {

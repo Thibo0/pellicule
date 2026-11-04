@@ -120,6 +120,30 @@ func usernameTaken(db execer, username string) (bool, error) {
 	return false, rows.Err()
 }
 
+// canonicalUsername : le nom tel qu'il est enregistré, quelle que soit la casse saisie (« élodie » → « Élodie »).
+// Les recherches `username=?` passent par COLLATE NOCASE, qui ne replie que l'ASCII ; sans ceci, un nom
+// accentué ne se connectait qu'avec sa casse exacte, alors que la règle d'unicité (usernameTaken) les confond.
+// Nom inconnu : renvoyé tel quel (la recherche échouera comme avant).
+func (a *App) canonicalUsername(name string) string {
+	name = strings.TrimSpace(name)
+	var u string
+	if a.db.QueryRow(`SELECT username FROM users WHERE username=?`, name).Scan(&u) == nil {
+		return u
+	}
+	rows, err := a.db.Query(`SELECT username FROM users`)
+	if err != nil {
+		return name
+	}
+	defer rows.Close()
+	key := foldUsername(name)
+	for rows.Next() {
+		if rows.Scan(&u) == nil && foldUsername(u) == key {
+			return u
+		}
+	}
+	return name
+}
+
 // --- enveloppe de clés d'un compte ---
 
 // KeyBundle : tout ce qu'un appareil doit récupérer pour retrouver la clé maître avec le mot de passe.
@@ -334,7 +358,7 @@ func (a *App) handlePrelogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var salt []byte
-	if a.db.QueryRow(`SELECT salt FROM users WHERE username=?`, strings.TrimSpace(body.Username)).Scan(&salt) != nil {
+	if a.db.QueryRow(`SELECT salt FROM users WHERE username=?`, a.canonicalUsername(body.Username)).Scan(&salt) != nil {
 		salt = fakeBytes(a.secret, "salt", body.Username, SaltSize)
 	}
 	writeJSON(w, map[string]any{"salt": salt})
@@ -442,7 +466,7 @@ func (a *App) checkLogin(w http.ResponseWriter, r *http.Request, username string
 	}
 	var id int64
 	var hash string
-	err := a.db.QueryRow(`SELECT id, auth_hash FROM users WHERE username = ?`, strings.TrimSpace(username)).Scan(&id, &hash)
+	err := a.db.QueryRow(`SELECT id, auth_hash FROM users WHERE username = ?`, a.canonicalUsername(username)).Scan(&id, &hash)
 	if err == nil && needsRecovery(hash) {
 		// base reconstruite (rebuild) : il n'y a plus de mot de passe, seulement la clé de secours.
 		// (Ceci révèle que le compte existe, seulement dans cet état transitoire.)
@@ -583,7 +607,7 @@ func (a *App) handleRecoverStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var box []byte
-	if a.db.QueryRow(`SELECT recovery_mk FROM users WHERE username=?`, strings.TrimSpace(body.Username)).Scan(&box) != nil {
+	if a.db.QueryRow(`SELECT recovery_mk FROM users WHERE username=?`, a.canonicalUsername(body.Username)).Scan(&box) != nil {
 		box = fakeBytes(a.secret, "recovery", body.Username, boxSize)
 	}
 	writeJSON(w, map[string]any{"recoveryMK": box})
@@ -613,7 +637,7 @@ func (a *App) handleRecover(w http.ResponseWriter, r *http.Request) {
 	}
 	var id int64
 	var stored string
-	err := a.db.QueryRow(`SELECT id, recovery_auth FROM users WHERE username=?`, strings.TrimSpace(body.Username)).Scan(&id, &stored)
+	err := a.db.QueryRow(`SELECT id, recovery_auth FROM users WHERE username=?`, a.canonicalUsername(body.Username)).Scan(&id, &stored)
 	if err != nil || !body.rewrap.valid() ||
 		subtle.ConstantTimeCompare([]byte(stored), []byte(recoveryAuthHash(body.RecoveryAuth))) != 1 {
 		httpError(w, http.StatusUnauthorized, "clé de secours incorrecte")
@@ -832,12 +856,6 @@ func (l *loginLimiter) recent(key string) []time.Time {
 	return keep
 }
 
-func (l *loginLimiter) blocked(key string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return len(l.recent(key)) >= 10
-}
-
 // reserve compte un essai pour chaque clé, d'un bloc, avant la vérification ; false si l'une est épuisée.
 // Ainsi des requêtes lancées en parallèle (bcrypt prend ~100 ms) ne passent pas toutes avant d'être comptées.
 // En cas de succès, l'appelant remet le compteur à zéro (reset).
@@ -863,12 +881,6 @@ func (l *loginLimiter) purge() {
 	for k := range l.fails {
 		l.recent(k)
 	}
-}
-
-func (l *loginLimiter) fail(key string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.fails[key] = append(l.recent(key), time.Now())
 }
 
 func (l *loginLimiter) reset(key string) {

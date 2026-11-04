@@ -616,10 +616,11 @@ func TestImportChiffreEtEfface(t *testing.T) {
 		t.Fatalf("%d élément(s) importé(s)", len(items))
 	}
 	m := items[0].(map[string]any)
-	fk, err := OpenFromPublic(c.priv, b64field(m, "fk"))
-	if err != nil {
+	opened, err := OpenFromPublic(c.priv, b64field(m, "fk"))
+	if err != nil || len(opened) != 2*KeySize {
 		t.Fatal("clé scellée illisible pour le propriétaire")
 	}
+	fk := opened[:KeySize] // suivie de l'empreinte du contenu
 	id := int64(m["id"].(float64))
 	_, _, enc := c.do("GET", "/api/assets/"+itoa(id)+"/original", nil)
 	var plain bytes.Buffer
@@ -1253,6 +1254,10 @@ func TestNomsDUtilisateur(t *testing.T) {
 	// même nom à la casse près (hors ASCII : COLLATE NOCASE ne le voit pas)
 	if code, _ := c.register("/api/register", "élodie", "motdepasse3", map[string]any{"token": token}); code != http.StatusBadRequest {
 		t.Fatalf("élodie acceptée à côté d'Élodie : %d", code)
+	}
+	// …et donc la connexion la retrouve quelle que soit la casse saisie
+	if code := newClient(t, srv, app.certFP, nil).login("élodie", "motdepasse2"); code != 200 {
+		t.Fatalf("connexion « élodie » au compte « Élodie » : %d", code)
 	}
 }
 

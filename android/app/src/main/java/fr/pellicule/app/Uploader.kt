@@ -73,9 +73,12 @@ class Uploader(private val ctx: Context, private val api: Api, private val mk: B
             .put("meta", Api.b64(Crypto.seal(fk, meta.toString().toByteArray(), Crypto.L.META)))
         var r = api.postJson("/api/assets", createBody)
         if (r.getString("status") == "duplicate") return Outcome.DUPLICATE
-        val id = r.getLong("id")
-        th.thumb?.let { api.put("/api/assets/$id/thumb", Crypto.seal(fk, it, Crypto.L.THUMB)) }
-        th.preview?.let { api.put("/api/assets/$id/preview", Crypto.seal(fk, it, Crypto.L.PREVIEW)) }
+        var id = r.getLong("id")
+        fun sendThumbs() {
+            th.thumb?.let { api.put("/api/assets/$id/thumb", Crypto.seal(fk, it, Crypto.L.THUMB)) }
+            th.preview?.let { api.put("/api/assets/$id/preview", Crypto.seal(fk, it, Crypto.L.PREVIEW)) }
+        }
+        sendThumbs()
 
         // 3. original chiffré, par morceaux, en reprenant où le serveur en est
         val enc = Crypto.StreamEncryptor(fk, prefix)
@@ -86,10 +89,13 @@ class Uploader(private val ctx: Context, private val api: Api, private val mk: B
         while (uploaded < encSize) {
             val firstChunk = maxOf(0L, (uploaded - Crypto.STREAM_HDR) / full).toInt()
             uploaded = sendFrom(item, id, enc, firstChunk, nChunks, uploaded, encSize) ?: run {
-                // position refusée (envoi concurrent, morceau perdu…) : on redemande où en est le serveur
-                if (++attempts > 3) throw IOException("envoi désynchronisé")
+                // position refusée, ou requête précédente pas encore abandonnée par le serveur (≤ 1 min) :
+                // on attend un peu puis on redemande où il en est
+                if (++attempts > 6) throw IOException("envoi désynchronisé")
+                Thread.sleep(attempts * 5_000L)
                 r = api.postJson("/api/assets", createBody)
                 if (r.getString("status") == "duplicate") return Outcome.DUPLICATE
+                if (r.getLong("id") != id) { id = r.getLong("id"); sendThumbs() } // envoi expiré côté serveur, recréé
                 r.optLong("uploaded", 0)
             }
         }

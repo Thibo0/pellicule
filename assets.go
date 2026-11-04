@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -131,8 +132,57 @@ func (a *App) ownedState(w http.ResponseWriter, r *http.Request, u *User) (int64
 	return id, s, true
 }
 
+// uploadLocks : un seul envoi à la fois par photo. Sans ça, une requête restée bloquée (téléphone sorti du
+// Wi-Fi) pouvait, en échouant après coup, tronquer le fichier qu'une requête plus récente venait de compléter.
+type uploadLocks struct {
+	mu   sync.Mutex
+	busy map[int64]bool
+}
+
+func (l *uploadLocks) try(id int64) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.busy[id] {
+		return false
+	}
+	if l.busy == nil {
+		l.busy = map[int64]bool{}
+	}
+	l.busy[id] = true
+	return true
+}
+
+func (l *uploadLocks) release(id int64) {
+	l.mu.Lock()
+	delete(l.busy, id)
+	l.mu.Unlock()
+}
+
+// uploadIdle : une requête d'envoi qui ne reçoit plus rien pendant ce délai est abandonnée (et libère la photo).
+const uploadIdle = 60 * time.Second
+
+// idleReader repousse l'échéance de lecture à chaque lecture : la connexion peut être lente, pas muette.
+type idleReader struct {
+	r  io.Reader
+	rc *http.ResponseController
+}
+
+func (i idleReader) Read(p []byte) (int, error) {
+	i.rc.SetReadDeadline(time.Now().Add(uploadIdle)) // ErrNotSupported (tests) : on garde l'échéance du serveur
+	return i.r.Read(p)
+}
+
 func (a *App) handlePutOriginal(w http.ResponseWriter, r *http.Request, u *User) {
-	id, s, ok := a.ownedState(w, r, u)
+	id, _, ok := a.ownedState(w, r, u)
+	if !ok {
+		return
+	}
+	if !a.uploads.try(id) {
+		httpError(w, http.StatusConflict, "envoi déjà en cours")
+		return
+	}
+	defer a.uploads.release(id)
+	_, s, ok := a.ownedState(w, r, u) // relu sous le verrou
 	if !ok {
 		return
 	}
@@ -158,7 +208,22 @@ func (a *App) handlePutOriginal(w http.ResponseWriter, r *http.Request, u *User)
 		return
 	}
 	defer f.Close()
-	// on repart toujours de la position validée : un morceau à moitié écrit est simplement réécrit
+	st, err := f.Stat()
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if st.Size() < offset {
+		// le fichier a perdu des octets que la base croyait reçus : on ne comble jamais le trou avec des zéros,
+		// on fait reprendre le client là où le fichier s'arrête vraiment (en début de bloc chiffré).
+		back := alignUpload(st.Size())
+		f.Truncate(back)
+		a.db.Exec(`UPDATE assets SET uploaded=? WHERE id=? AND uploaded=?`, back, id, s.uploaded)
+		w.Header().Set("X-Uploaded", strconv.FormatInt(back, 10))
+		httpError(w, http.StatusConflict, "position incorrecte")
+		return
+	}
+	// au-delà de la position validée : reste d'un morceau à moitié écrit, simplement réécrit
 	if err := f.Truncate(offset); err != nil {
 		serverError(w, err)
 		return
@@ -167,7 +232,8 @@ func (a *App) handlePutOriginal(w http.ResponseWriter, r *http.Request, u *User)
 		serverError(w, err)
 		return
 	}
-	n, err := io.Copy(f, io.LimitReader(r.Body, limit+1))
+	body := idleReader{io.LimitReader(r.Body, limit+1), http.NewResponseController(w)}
+	n, err := io.Copy(f, body)
 	if n > limit {
 		f.Truncate(offset)
 		httpError(w, http.StatusRequestEntityTooLarge, "morceau trop grand")
@@ -181,8 +247,24 @@ func (a *App) handlePutOriginal(w http.ResponseWriter, r *http.Request, u *User)
 		httpError(w, http.StatusBadRequest, "envoi interrompu")
 		return
 	}
-	a.db.Exec(`UPDATE assets SET uploaded=? WHERE id=?`, offset+n, id)
+	res, err := a.db.Exec(`UPDATE assets SET uploaded=? WHERE id=? AND uploaded=?`, offset+n, id, offset)
+	if c, _ := res.RowsAffected(); err != nil || c != 1 {
+		if err == nil {
+			err = fmt.Errorf("asset %d : position modifiée pendant l'envoi", id)
+		}
+		serverError(w, err)
+		return
+	}
 	writeJSON(w, map[string]any{"uploaded": offset + n})
+}
+
+// alignUpload ramène une position au dernier début de bloc chiffré complet.
+func alignUpload(n int64) int64 {
+	if n < StreamHdrSize {
+		return 0
+	}
+	full := int64(ChunkSize + TagSize)
+	return StreamHdrSize + (n-StreamHdrSize)/full*full
 }
 
 func (a *App) putSmallBlob(variant, column string, max int64) userHandler {
@@ -231,7 +313,18 @@ func (a *App) handleCompleteAsset(w http.ResponseWriter, r *http.Request, u *Use
 		httpError(w, http.StatusConflict, fmt.Sprintf("envoi incomplet (%d / %d octets)", s.uploaded, s.size))
 		return
 	}
+	if !a.uploads.try(id) {
+		httpError(w, http.StatusConflict, "envoi déjà en cours")
+		return
+	}
+	defer a.uploads.release(id)
 	part, final := a.blobPath(u.ID, id, "o.part"), a.blobPath(u.ID, id, "o")
+	if st, err := os.Stat(part); err != nil || st.Size() != s.size {
+		a.db.Exec(`UPDATE assets SET uploaded=0 WHERE id=? AND complete=0`, id)
+		os.Remove(part)
+		httpError(w, http.StatusConflict, "fichier reçu incomplet : envoi à refaire")
+		return
+	}
 	if !hasStreamMagic(part) {
 		httpError(w, http.StatusBadRequest, "fichier chiffré invalide")
 		return
@@ -285,31 +378,68 @@ func (a *App) handleCheck(w http.ResponseWriter, r *http.Request, u *User) {
 }
 
 // handleRewrapKeys : l'import a scellé la clé du fichier pour la clé publique du compte ; le client,
-// qui seul peut l'ouvrir, la rechiffre avec sa clé maître.
+// qui seul peut l'ouvrir, la rechiffre avec sa clé maître. Il envoie aussi le dedupTag (calculé depuis
+// l'empreinte scellée avec la clé) : une photo importée déjà sauvegardée par l'app est alors supprimée.
 func (a *App) handleRewrapKeys(w http.ResponseWriter, r *http.Request, u *User) {
 	var body struct {
 		Keys []struct {
-			ID int64  `json:"id"`
-			FK []byte `json:"fk"`
+			ID       int64  `json:"id"`
+			FK       []byte `json:"fk"`
+			DedupTag string `json:"dedupTag"`
 		} `json:"keys"`
 	}
 	if !readJSON(w, r, &body) {
 		return
 	}
-	n := 0
+	n, dupes := 0, 0
 	for _, k := range body.Keys {
-		if len(k.FK) != boxSize {
+		if len(k.FK) != boxSize || (k.DedupTag != "" && !validTag(k.DedupTag)) {
 			continue
 		}
 		res, err := a.db.Exec(`UPDATE assets SET wrapped_fk=?, fk_sealed=0 WHERE id=? AND owner_id=? AND fk_sealed=1`, k.FK, k.ID, u.ID)
-		if err == nil {
-			if c, _ := res.RowsAffected(); c > 0 {
-				n++
-				a.writeAssetFiles(k.ID)
-			}
+		if err != nil {
+			continue
 		}
+		if c, _ := res.RowsAffected(); c == 0 {
+			continue
+		}
+		n++
+		if k.DedupTag != "" && a.dedupImported(u.ID, k.ID, strings.ToLower(k.DedupTag)) {
+			dupes++
+			continue
+		}
+		a.writeAssetFiles(k.ID)
 	}
-	writeJSON(w, map[string]any{"updated": n})
+	writeJSON(w, map[string]any{"updated": n, "duplicates": dupes})
+}
+
+// dedupImported donne son dedupTag à une photo importée ; si la même photo existe déjà (envoyée par l'app,
+// ou importée deux fois), la copie importée est supprimée — sauf si on l'a déjà rangée ou mise en favori.
+// Renvoie vrai si elle a été supprimée.
+func (a *App) dedupImported(owner, id int64, tag string) bool {
+	var other int64
+	var complete bool
+	var trashed sql.NullInt64
+	err := a.db.QueryRow(`SELECT id, complete, trashed_at FROM assets WHERE owner_id=? AND dedup_tag=? AND id<>?`, owner, tag, id).
+		Scan(&other, &complete, &trashed)
+	if errors.Is(err, sql.ErrNoRows) {
+		a.db.Exec(`UPDATE assets SET dedup_tag=? WHERE id=? AND dedup_tag IS NULL`, tag, id)
+		return false
+	}
+	if err != nil || !complete { // envoi de l'app en cours : on garde les deux, sans étiquette pour celle-ci
+		return false
+	}
+	var kept bool
+	a.db.QueryRow(`SELECT favorite=1 OR EXISTS(SELECT 1 FROM album_assets WHERE asset_id=?) FROM assets WHERE id=?`, id, id).Scan(&kept)
+	if kept {
+		return false
+	}
+	if trashed.Valid { // comme un renvoi depuis l'app : la photo revient de la corbeille
+		a.db.Exec(`UPDATE assets SET trashed_at=NULL WHERE id=?`, other)
+		a.writeAssetFiles(other)
+	}
+	a.purge([]purgeItem{{owner, id}})
+	return true
 }
 
 // --- consultation ---
@@ -445,7 +575,11 @@ func (a *App) handleFavorite(w http.ResponseWriter, r *http.Request, u *User) {
 		IDs      []int64 `json:"ids"`
 		Favorite bool    `json:"favorite"`
 	}
-	if !readJSON(w, r, &body) || len(body.IDs) == 0 || len(body.IDs) > 20000 {
+	if !readJSON(w, r, &body) {
+		return
+	}
+	if len(body.IDs) == 0 || len(body.IDs) > 20000 {
+		httpError(w, http.StatusBadRequest, "sélection vide ou trop grande")
 		return
 	}
 	ph, args := placeholders(body.IDs)
@@ -508,16 +642,24 @@ func (a *App) purgeWhere(where string, args ...any) int {
 // purge supprime définitivement fichiers et entrées.
 func (a *App) purge(items []purgeItem) {
 	for _, p := range items {
-		failed := false
-		for _, v := range []string{"o", "o.part", "m", "s", "k"} {
-			if err := os.Remove(a.blobPath(p.owner, p.id, v)); err != nil && !errors.Is(err, os.ErrNotExist) {
-				log.Printf("suppression de #%d.%s : %v", p.id, v, err)
-				failed = true
-			}
+		a.purgeOne(p)
+	}
+}
+
+// purgeOne : sous le verrou des fichiers de clé, pour qu'une écriture en attente ne recrée pas le .k
+// entre son effacement et celui de la ligne.
+func (a *App) purgeOne(p purgeItem) {
+	a.files.wmu.Lock()
+	defer a.files.wmu.Unlock()
+	failed := false
+	for _, v := range []string{"o", "o.part", "m", "s", "k"} {
+		if err := os.Remove(a.blobPath(p.owner, p.id, v)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("suppression de #%d.%s : %v", p.id, v, err)
+			failed = true
 		}
-		if !failed {
-			a.db.Exec(`DELETE FROM assets WHERE id=?`, p.id)
-		}
+	}
+	if !failed {
+		a.db.Exec(`DELETE FROM assets WHERE id=?`, p.id)
 	}
 }
 

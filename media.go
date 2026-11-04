@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -151,25 +153,44 @@ func exifOrientation(x *exif.Exif) int {
 	return 1
 }
 
-func quickTakenAt(path, mime string) time.Time {
-	if mime != "image/jpeg" {
-		return time.Time{}
-	}
-	if x := readExif(path); x != nil {
-		return exifDate(x)
-	}
-	return time.Time{}
-}
-
 // --- outils externes (libvips / ffmpeg), facultatifs mais recommandés ---
 
 type tools struct {
 	vipsthumbnail, vipsheader, ffmpeg, ffprobe string
+	vipsTooOld                                 string // version de libvips écartée (voir detectTools)
 }
 
 func detectTools() tools {
 	look := func(n string) string { p, _ := exec.LookPath(n); return p }
-	return tools{look("vipsthumbnail"), look("vipsheader"), look("ffmpeg"), look("ffprobe")}
+	t := tools{vipsthumbnail: look("vipsthumbnail"), vipsheader: look("vipsheader"), ffmpeg: look("ffmpeg"), ffprobe: look("ffprobe")}
+	if t.vipsthumbnail != "" || t.vipsheader != "" {
+		// VIPS_BLOCK_UNTRUSTED (R16) n'existe qu'à partir de libvips 8.13 : avant, il est ignoré sans erreur et
+		// un fichier piégé déposé dans Import/ pourrait atteindre ImageMagick. On n'utilise pas un libvips plus ancien.
+		var out []byte
+		if v := look("vips"); v != "" {
+			out, _ = run(10*time.Second, v, "--version") // « vips-8.14.1 »
+		}
+		if _, ok := vipsVersionOK(string(out)); !ok && t.vipsthumbnail != "" {
+			out, _ = run(10*time.Second, t.vipsthumbnail, "--vips-version") // option commune aux outils libvips
+		}
+		if ver, ok := vipsVersionOK(string(out)); !ok {
+			t.vipsthumbnail, t.vipsheader, t.vipsTooOld = "", "", ver
+		}
+	}
+	return t
+}
+
+var vipsVersionRe = regexp.MustCompile(`(\d+)\.(\d+)\.\d+`)
+
+// vipsVersionOK lit la sortie de « vips --version » (« vips-8.14.1 ») ; vrai à partir de 8.13.
+func vipsVersionOK(out string) (string, bool) {
+	m := vipsVersionRe.FindStringSubmatch(out)
+	if m == nil {
+		return "inconnue", false
+	}
+	major, _ := strconv.Atoi(m[1])
+	minor, _ := strconv.Atoi(m[2])
+	return m[0], major > 8 || (major == 8 && minor >= 13)
 }
 
 func (t tools) summary() map[string]bool {
@@ -177,7 +198,10 @@ func (t tools) summary() map[string]bool {
 }
 
 func (t tools) report() {
-	if t.vipsthumbnail == "" {
+	if t.vipsTooOld != "" {
+		log.Printf("libvips %s ignoré : il faut la version 8.13 ou plus pour bloquer les décodeurs non sûrs "+
+			"(Debian 12 / Ubuntu 24.04). Miniatures JPEG/PNG/WebP seulement, pas de HEIC.", t.vipsTooOld)
+	} else if t.vipsthumbnail == "" {
 		log.Print("libvips absent : miniatures JPEG/PNG/WebP seulement (HEIC iPhone non pris en charge). Installer libvips-tools.")
 	}
 	if t.ffmpeg == "" || t.ffprobe == "" {
@@ -391,6 +415,9 @@ func goDecodable(path string) bool {
 	return false
 }
 
+// maxGoPixels : au-delà, pas de miniature par le décodeur Go (libvips, lui, lit l'image par morceaux).
+const maxGoPixels = 50_000_000
+
 // goResize : repli en Go pur (sans libvips) pour JPEG/PNG/GIF/WebP.
 func goResize(src, dst string, size int, square bool) error {
 	if !goDecodable(src) {
@@ -400,8 +427,20 @@ func goResize(src, dst string, size int, square bool) error {
 	if err != nil {
 		return err
 	}
+	defer f.Close()
+	// les dimensions d'abord : image.Decode alloue tout le bitmap d'un coup (4 octets/pixel en RVBA), et le
+	// service est limité à 450 Mo. Sans ce contrôle, une image géante le ferait tuer (deux fois) avant d'être écartée.
+	cfg, _, err := image.DecodeConfig(f)
+	if err != nil {
+		return err
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > maxGoPixels {
+		return fmt.Errorf("image trop grande pour le décodeur intégré (%d × %d)", cfg.Width, cfg.Height)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	img, _, err := image.Decode(f)
-	f.Close()
 	if err != nil {
 		return err
 	}

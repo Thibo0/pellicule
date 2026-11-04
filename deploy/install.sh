@@ -24,23 +24,103 @@ esac
 DIR="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$DIR/$BIN" ] || die "$BIN introuvable à côté du script"
 
+# adresse IPv4 de la VM sur le réseau local (celle du QR code) ; hostname -I peut commencer par une IPv6
+lan_ip() {
+  local ip
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')"
+  [ -n "$ip" ] || ip="$(hostname -I | tr ' ' '\n' | grep -E '^[0-9]+(\.[0-9]+){3}$' | head -n 1)"
+  [ -n "$ip" ] || die "adresse IPv4 de la VM introuvable"
+  echo "$ip"
+}
+
+install_packages() {
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libvips-tools ffmpeg cifs-utils ca-certificates
+  # VIPS_BLOCK_UNTRUSTED (blocage des décodeurs non sûrs, R16) n'existe qu'à partir de libvips 8.13
+  local v
+  v="$(vips --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n 1 || true)"
+  if [ -z "$v" ] || [ "$(printf '%s\n%s\n' "$v" 8.13 | sort -V | head -n 1)" != 8.13 ]; then
+    echo
+    echo "Attention : libvips ${v:-?} est trop ancien (8.13 minimum, Debian 12 ou Ubuntu 24.04)."
+    echo "Pellicule ne l'utilisera pas : miniatures JPEG/PNG/WebP seulement, pas de HEIC."
+  fi
+}
+
+# write_unit : le service systemd (réécrit aussi à chaque mise à jour, pour que les durcissements suivent)
+write_unit() {
+cat > "$UNIT" <<EOF
+[Unit]
+Description=Pellicule (photos)
+After=network-online.target remote-fs.target
+Wants=network-online.target
+$( [ "$SMB" = 1 ] && echo "RequiresMountsFor=$MNT" )
+
+[Service]
+User=pellicule
+Group=pellicule
+Environment=PELLICULE_ADDR=:$PORT
+Environment=PELLICULE_DATA=/var/lib/pellicule
+Environment="PELLICULE_LIBRARY=$LIB"
+Environment=PELLICULE_REQUIRE_MARKER=1
+Environment=GOMEMLIMIT=200MiB
+Environment=TZ=Europe/Paris
+ExecStart=/usr/local/bin/pellicule
+Restart=always
+RestartSec=15
+Nice=5
+MemoryMax=450M
+UMask=0077
+# confinement : le service n'écrit que dans sa base et dans le dossier des photos
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pellicule "$LIB"
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 # --- mise à jour d'une installation existante ---
 if [ -f "$UNIT" ] && confirm "Pellicule est déjà installé. Mettre à jour le programme seulement ?"; then
   say "Mise à jour"
+  # réglages de l'installation existante, relus dans le service actuel
+  LIB="$(grep -m 1 'PELLICULE_LIBRARY=' "$UNIT" | sed 's/.*PELLICULE_LIBRARY=//; s/"$//')"
+  OLDPORT="$(grep -m 1 'PELLICULE_ADDR=' "$UNIT" | sed 's/.*://; s/"$//')"
+  PORT="${OLDPORT:-$PORT}"
+  SMB=0; grep -q '^RequiresMountsFor=' "$UNIT" && SMB=1
+  [ -n "$LIB" ] || die "dossier des photos introuvable dans $UNIT"
+  install_packages
   systemctl stop pellicule
   install -m 755 "$DIR/$BIN" /usr/local/bin/pellicule
+  write_unit
+  systemctl daemon-reload
   systemctl start pellicule
   sleep 2
   systemctl is-active --quiet pellicule && echo "OK, Pellicule est à jour et tourne." \
     || { journalctl -u pellicule -n 20 --no-pager; die "le service ne démarre pas"; }
   # compte pas encore créé : on réaffiche le QR code d'installation
-  runuser -u pellicule -- /usr/local/bin/pellicule -data /var/lib/pellicule setup-qr "https://$(hostname -I | awk '{print $1}'):$PORT" || true
+  runuser -u pellicule -- /usr/local/bin/pellicule -data /var/lib/pellicule setup-qr "https://$(lan_ip):$PORT" || true
   exit 0
 fi
 
 say "1/5 Paquets (libvips et ffmpeg : miniatures des fichiers déposés par FolderSync)"
-apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libvips-tools ffmpeg cifs-utils ca-certificates
+install_packages
 
 say "2/5 Utilisateur système « pellicule »"
 id pellicule >/dev/null 2>&1 || useradd --system --home-dir /var/lib/pellicule --shell /usr/sbin/nologin pellicule
@@ -119,52 +199,7 @@ if [ ! -f /var/lib/pellicule/pellicule.db ] && ls "$LIB"/u*/compte.json >/dev/nu
 fi
 
 say "4/5 Service systemd"
-cat > "$UNIT" <<EOF
-[Unit]
-Description=Pellicule (photos)
-After=network-online.target remote-fs.target
-Wants=network-online.target
-$( [ "$SMB" = 1 ] && echo "RequiresMountsFor=$MNT" )
-
-[Service]
-User=pellicule
-Group=pellicule
-Environment=PELLICULE_ADDR=:$PORT
-Environment=PELLICULE_DATA=/var/lib/pellicule
-Environment="PELLICULE_LIBRARY=$LIB"
-Environment=PELLICULE_REQUIRE_MARKER=1
-Environment=GOMEMLIMIT=200MiB
-Environment=TZ=Europe/Paris
-ExecStart=/usr/local/bin/pellicule
-Restart=always
-RestartSec=15
-Nice=5
-MemoryMax=450M
-UMask=0077
-# confinement : le service n'écrit que dans sa base et dans le dossier des photos
-NoNewPrivileges=yes
-ProtectSystem=strict
-ReadWritePaths=/var/lib/pellicule "$LIB"
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-RestrictNamespaces=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-SystemCallArchitectures=native
-CapabilityBoundingSet=
-
-[Install]
-WantedBy=multi-user.target
-EOF
+write_unit
 systemctl daemon-reload
 systemctl enable --now pellicule
 sleep 3
@@ -173,7 +208,7 @@ if ! systemctl is-active --quiet pellicule; then
   die "le service ne démarre pas (voir les lignes ci-dessus)"
 fi
 
-IP="$(hostname -I | awk '{print $1}')"
+IP="$(lan_ip)"
 P() { runuser -u pellicule -- /usr/local/bin/pellicule -data /var/lib/pellicule "$@"; }
 say "5/5 Terminé !"
 if [ "${RESTORED:-0}" = 1 ]; then
