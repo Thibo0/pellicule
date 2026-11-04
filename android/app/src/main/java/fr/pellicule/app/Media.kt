@@ -104,8 +104,20 @@ object Media {
     fun mimeIsVideo(mime: String) = mime.startsWith("video/")
 }
 
-/** Ce qui a déjà été envoyé depuis ce téléphone (identifiant MediaStore + taille). */
-class UploadedDb(ctx: Context) : SQLiteOpenHelper(ctx.applicationContext, "uploaded.db", null, 1) {
+/**
+ * Ce qui a déjà été envoyé depuis ce téléphone (identifiant MediaStore + taille).
+ * Une seule instance par processus ([of]) : la page interroge l'état toutes les 2 s, et chaque nouvelle
+ * instance ouvrait une connexion SQLite jamais refermée.
+ */
+class UploadedDb private constructor(ctx: Context) : SQLiteOpenHelper(ctx.applicationContext, "uploaded.db", null, 1) {
+    companion object {
+        @Volatile private var instance: UploadedDb? = null
+
+        /** Instance partagée (SQLiteOpenHelper est prévu pour être partagé entre threads). */
+        fun of(ctx: Context): UploadedDb =
+            instance ?: synchronized(this) { instance ?: UploadedDb(ctx).also { instance = it } }
+    }
+
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE done (media_id INTEGER PRIMARY KEY, size INTEGER NOT NULL)")
     }

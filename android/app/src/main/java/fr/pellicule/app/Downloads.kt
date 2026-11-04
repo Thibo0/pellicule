@@ -25,7 +25,7 @@ object Downloads {
             val uri = ctx.contentResolver.insert(collection, values) ?: throw IOException("galerie inaccessible")
             try {
                 api.stream(url).use { src ->
-                    ctx.contentResolver.openOutputStream(uri)!!.use { dst -> Crypto.decryptStream(fk, src, dst) }
+                    (ctx.contentResolver.openOutputStream(uri) ?: throw IOException("galerie inaccessible")).use { dst -> Crypto.decryptStream(fk, src, dst) }
                 }
                 ctx.contentResolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
             } catch (e: Exception) {

@@ -43,17 +43,37 @@ class PairActivity : ComponentActivity() {
     private lateinit var col: LinearLayout
     private lateinit var error: TextView
 
+    /** Pourquoi on arrive sur le serveur : décide de l'écran (création de compte ou mot de passe) et de l'appel. */
+    private enum class Kind {
+        SETUP, // QR code de fin d'installation : premier compte, administrateur
+        INVITE, // invitation d'un membre : création de compte
+        PAIR, // QR code d'appairage du navigateur : code + mot de passe
+        LOGIN, // compte existant, nom + mot de passe (QR de reconnexion ou saisie)
+        UNLOCK; // téléphone déjà appairé dont la clé maître manque
+
+        companion object {
+            /** Hôte d'un QR code « pellicule://<type>?… » ; null si ce type n'est pas attendu dans un QR code. */
+            fun fromQr(host: String?): Kind? = when (host) {
+                "setup" -> SETUP
+                "invite" -> INVITE
+                "pair" -> PAIR
+                "login" -> LOGIN
+                else -> null
+            }
+        }
+    }
+
     /** Ce que le téléphone sait du serveur (QR code ou saisie). */
-    private class Target(val server: String, val fp: String, val kind: String, val code: String = "", val user: String = "")
+    private class Target(val server: String, val fp: String, val kind: Kind, val code: String = "", val user: String = "")
 
     private val scan = registerForActivityResult(ScanContract()) { r ->
         val text = r.contents ?: return@registerForActivityResult
         val uri = Uri.parse(text.replaceFirst(Regex("^pellicule:"), "pellicule://"))
         val url = uri.getQueryParameter("url")
         val fp = uri.getQueryParameter("fp")
-        val kind = uri.host ?: ""
+        val kind = Kind.fromQr(uri.host)
         val code = uri.getQueryParameter("code") ?: uri.getQueryParameter("token") ?: ""
-        if (uri.scheme != "pellicule" || url.isNullOrEmpty() || kind !in setOf("setup", "invite", "pair", "login")) {
+        if (uri.scheme != "pellicule" || url.isNullOrEmpty() || kind == null) {
             error.text = "Ce QR code ne vient pas de Pellicule."
             return@registerForActivityResult
         }
@@ -85,7 +105,7 @@ class PairActivity : ComponentActivity() {
             addView(col)
             padForSystemBars()
         })
-        if (prefs.paired) showPassword(Target(prefs.server, prefs.fingerprint, "unlock", user = prefs.username)) else showWelcome()
+        if (prefs.paired) showPassword(Target(prefs.server, prefs.fingerprint, Kind.UNLOCK, user = prefs.username)) else showWelcome()
     }
 
     // --- petits outils d'écran ---
@@ -141,14 +161,14 @@ class PairActivity : ComponentActivity() {
                     busy(go, false, "Continuer")
                     confirmFingerprint(fp) {
                         val c = code.text.toString().trim()
-                        if (login) return@confirmFingerprint showPassword(Target(srv, fp, "login"))
+                        if (login) return@confirmFingerprint showPassword(Target(srv, fp, Kind.LOGIN))
                         lifecycleScope.launch {
                             // le serveur dit s'il attend encore son administrateur ; sinon, code à 48 chiffres hexa = invitation
                             val needsSetup = runCatching { withContext(Dispatchers.IO) { Api(srv, fp).getJson("/api/me").optBoolean("needsSetup") } }.getOrDefault(false)
                             go(Target(srv, fp, when {
-                                needsSetup -> "setup"
-                                Regex("^[0-9a-fA-F]{48}$").matches(c) -> "invite"
-                                else -> "pair"
+                                needsSetup -> Kind.SETUP
+                                Regex("^[0-9a-fA-F]{48}$").matches(c) -> Kind.INVITE
+                                else -> Kind.PAIR
                             }, c))
                         }
                     }
@@ -205,15 +225,15 @@ class PairActivity : ComponentActivity() {
     }
 
     private fun go(t: Target) = when (t.kind) {
-        "setup", "invite" -> showCreate(t)
+        Kind.SETUP, Kind.INVITE -> showCreate(t)
         else -> showPassword(t)
     }
 
     // --- création du compte (installation ou invitation) ---
 
     private fun showCreate(t: Target) {
-        header(if (t.kind == "setup") "Ton compte" else "Créer ton compte",
-            if (t.kind == "setup") "Tu es la première personne sur ce serveur : ce compte en sera l'administrateur."
+        header(if (t.kind == Kind.SETUP) "Ton compte" else "Créer ton compte",
+            if (t.kind == Kind.SETUP) "Tu es la première personne sur ce serveur : ce compte en sera l'administrateur."
             else "Tu as été invité sur ce serveur Pellicule.")
         val user = field("Nom (ex. marie)").apply { imeOptions = EditorInfo.IME_ACTION_NEXT }
         val pw = passwordField("Mot de passe (10 caractères minimum)")
@@ -260,8 +280,8 @@ class PairActivity : ComponentActivity() {
         val acct = Crypto.newAccount(username, password, Api::b64)
         try {
             val body = acct.body.put("deviceName", Build.MODEL ?: "Téléphone")
-            if (t.kind == "setup") body.put("setupCode", t.code) else body.put("token", t.code)
-            Api(t.server, t.fp).postJson(if (t.kind == "setup") "/api/setup" else "/api/register", body)
+            if (t.kind == Kind.SETUP) body.put("setupCode", t.code) else body.put("token", t.code)
+            Api(t.server, t.fp).postJson(if (t.kind == Kind.SETUP) "/api/setup" else "/api/register", body)
             Keys.saveMasterKey(this, acct.masterKey)
         } finally {
             acct.masterKey.fill(0)
@@ -329,7 +349,7 @@ class PairActivity : ComponentActivity() {
 
     private fun showPassword(t: Target) {
         val known = t.user.isNotEmpty()
-        header(if (t.kind == "unlock") "Déverrouiller" else "Connexion",
+        header(if (t.kind == Kind.UNLOCK) "Déverrouiller" else "Connexion",
             if (known) "Compte « ${t.user} ». Saisis ton mot de passe une seule fois : il déchiffre tes photos sur ce téléphone."
             else "Ton nom et ton mot de passe : ils déchiffrent tes photos sur ce téléphone (le mot de passe n'y est pas gardé).")
         val user = field("Ton nom").apply { setText(t.user); imeOptions = EditorInfo.IME_ACTION_NEXT }
@@ -346,7 +366,7 @@ class PairActivity : ComponentActivity() {
                     withContext(Dispatchers.IO) { login(t, u, pw) }
                     finishSetup()
                 } catch (e: GeneralSecurityException) {
-                    if (t.kind == "pair" && prefs.paired) showPassword(Target(t.server, t.fp, "unlock", user = u))
+                    if (t.kind == Kind.PAIR && prefs.paired) showPassword(Target(t.server, t.fp, Kind.UNLOCK, user = u))
                     error.text = "Mot de passe incorrect."
                 } catch (e: Api.BadCertificate) {
                     error.text = "Le serveur ne présente pas le certificat attendu. Arrêté par sécurité."
@@ -354,10 +374,10 @@ class PairActivity : ComponentActivity() {
                     if (e.code == 409) return@launch showRecoverAccount(t, u,
                         "Le serveur a été réinstallé : reprends ton compte avec ta clé de secours, puis choisis un nouveau mot de passe.")
                     error.text = when (e.code) {
-                        401 -> if (t.kind == "unlock") "Ce téléphone n'est plus appairé." else "Nom ou mot de passe incorrect."
+                        401 -> if (t.kind == Kind.UNLOCK) "Ce téléphone n'est plus appairé." else "Nom ou mot de passe incorrect."
                         else -> e.message
                     }
-                    if (e.code == 401 && t.kind == "unlock") { Keys.forget(this@PairActivity); prefs.fingerprint = ""; showWelcome() }
+                    if (e.code == 401 && t.kind == Kind.UNLOCK) { Keys.forget(this@PairActivity); prefs.fingerprint = ""; showWelcome() }
                 } catch (e: Exception) {
                     error.text = "Impossible de joindre le serveur. Le téléphone est-il sur le Wi-Fi de la maison ?"
                 } finally {
@@ -371,10 +391,10 @@ class PairActivity : ComponentActivity() {
         col.addView(caption("Mot de passe"))
         col.addView(pass, full())
         col.addView(go, full(22))
-        if (t.kind != "unlock") col.addView(button("Mot de passe oublié / serveur réinstallé", primary = false) {
+        if (t.kind != Kind.UNLOCK) col.addView(button("Mot de passe oublié / serveur réinstallé", primary = false) {
             showRecoverAccount(t, user.text.toString().trim(), "")
         }, full(10))
-        col.addView(button(if (t.kind == "unlock") "Repartir de zéro" else "Retour", primary = false) {
+        col.addView(button(if (t.kind == Kind.UNLOCK) "Repartir de zéro" else "Retour", primary = false) {
             Keys.forget(this); prefs.fingerprint = ""; showWelcome()
         }, full(10))
         addError()
@@ -394,17 +414,23 @@ class PairActivity : ComponentActivity() {
             val u = user.text.toString().trim()
             val p = pw.text.toString()
             val key = runCatching { Crypto.parseRecovery(rec.text.toString()) }.getOrNull()
-            when {
-                u.isEmpty() -> { error.text = "Indique ton nom."; return@button }
-                key == null -> { error.text = "Clé de secours incomplète : 52 caractères (lettres, et chiffres de 2 à 7)."; return@button }
-                p.length < 10 -> { error.text = "Nouveau mot de passe trop court (10 caractères minimum)."; return@button }
-                p != pw2.text.toString() -> { error.text = "Les deux mots de passe ne correspondent pas."; return@button }
+            val problem = when {
+                u.isEmpty() -> "Indique ton nom."
+                key == null -> "Clé de secours incomplète : 52 caractères (lettres, et chiffres de 2 à 7)."
+                p.length < 10 -> "Nouveau mot de passe trop court (10 caractères minimum)."
+                p != pw2.text.toString() -> "Les deux mots de passe ne correspondent pas."
+                else -> null
+            }
+            if (problem != null || key == null) {
+                key?.fill(0) // clé lue mais formulaire refusé : on ne la garde pas en mémoire
+                error.text = problem
+                return@button
             }
             busy(go, true, "Vérification…")
             error.text = ""
             lifecycleScope.launch {
                 try {
-                    withContext(Dispatchers.IO) { recoverAccount(t, u, key!!, p) }
+                    withContext(Dispatchers.IO) { recoverAccount(t, u, key, p) }
                     finishSetup()
                 } catch (e: GeneralSecurityException) {
                     error.text = BAD_RECOVERY
@@ -483,18 +509,18 @@ class PairActivity : ComponentActivity() {
      * téléphone déjà appairé.
      */
     private fun login(t: Target, username: String, password: String) {
-        if (t.kind != "unlock") Keys.createDeviceKey(this)
+        if (t.kind != Kind.UNLOCK) Keys.createDeviceKey(this)
         val api = Api(t.server, t.fp)
         val pk = Crypto.passwordKeys(password, api.prelogin(username))
         try {
             val bundle: JSONObject = when (t.kind) {
-                "pair" -> {
+                Kind.PAIR -> {
                     api.pair(t.code, Build.MODEL ?: "Téléphone")
                     // appairé dès maintenant : une faute de frappe dans le mot de passe ne doit pas faire perdre le code
                     prefs.server = t.server; prefs.fingerprint = t.fp; prefs.username = username; prefs.wrappedMK = ""
                     api.keyBundle()
                 }
-                "unlock" -> api.keyBundle()
+                Kind.UNLOCK -> api.keyBundle()
                 else -> api.postJson("/api/devices/login", JSONObject()
                     .put("username", username).put("authKey", Api.b64(pk.authKey)).put("name", Build.MODEL ?: "Téléphone"))
                     .getJSONObject("keys")

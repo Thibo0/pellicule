@@ -18,6 +18,7 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
@@ -122,7 +123,7 @@ class BackupWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 
     private suspend fun send(ctx: Context, api: Api, mk: ByteArray) {
         val up = Uploader(ctx, api, mk)
-        val db = UploadedDb(ctx)
+        val db = UploadedDb.of(ctx)
         val done = db.doneIds()
         var todo = Media.toBackup(ctx, prefs).filter { done[it.id] != it.size }
 
@@ -198,6 +199,8 @@ class BackupWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
             else ForegroundInfo(NOTIF_ID, n)
         )
         true
+    } catch (e: CancellationException) {
+        throw e // travail arrêté par WorkManager : ce n'est pas un refus du premier plan
     } catch (e: Exception) {
         false
     }

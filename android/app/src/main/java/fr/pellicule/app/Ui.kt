@@ -100,7 +100,7 @@ fun Activity.logoutPellicule() {
     Prefs(this).fingerprint = ""
     CookieManager.getInstance().removeAllCookies(null)
     WebStorage.getInstance().deleteAllData() // IndexedDB de la page (clés non extractibles, mais autant tout effacer)
-    UploadedDb(this).clear()
+    UploadedDb.of(this).clear()
     startActivity(Intent(this, PairActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK))
     finish()
 }

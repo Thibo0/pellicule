@@ -52,11 +52,12 @@ class MainActivity : ComponentActivity() {
     private val pickFiles = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val cb = fileCallback ?: return@registerForActivityResult
         fileCallback = null
-        val data = r.data
+        val data = r.data.takeIf { r.resultCode == RESULT_OK }
+        val clip = data?.clipData
+        val single = data?.data
         val uris = when {
-            r.resultCode != RESULT_OK || data == null -> null
-            data.clipData != null -> Array(data.clipData!!.itemCount) { data.clipData!!.getItemAt(it).uri }
-            data.data != null -> arrayOf(data.data!!)
+            clip != null -> Array(clip.itemCount) { clip.getItemAt(it).uri }
+            single != null -> arrayOf(single)
             else -> null
         }
         cb.onReceiveValue(uris)
@@ -310,7 +311,7 @@ class Bridge(private val act: MainActivity) {
         .put("running", prefs.running)
         .put("lastRun", prefs.lastRun)
         .put("lastResult", prefs.lastResult)
-        .put("done", UploadedDb(act).count())
+        .put("done", UploadedDb.of(act).count())
         .put("permission", Media.hasPermission(act))
         .put("videos", prefs.includeVideos)
         .put("progressDone", prefs.progressDone)
@@ -330,18 +331,17 @@ class Bridge(private val act: MainActivity) {
     /** La page ne voit pas d'utilisateur : on vérifie par notre propre connexion mTLS avant d'effacer les clés. */
     @JavascriptInterface
     fun checkRevoked() {
-        Thread {
-            val r = Api.of(prefs).reach()
-            act.runOnUiThread {
-                when (r) {
-                    Api.Reach.REVOKED -> {
-                        Toast.makeText(act, "Ce téléphone a été révoqué : ses clés sont effacées. Appaire-le de nouveau.", Toast.LENGTH_LONG).show()
-                        act.logoutPellicule()
-                    }
-                    else -> act.reloadLater()
+        // lié à l'activité : si elle est fermée entre-temps, on n'agit plus sur une activité détruite
+        act.lifecycleScope.launch {
+            val r = withContext(Dispatchers.IO) { Api.of(prefs).reach() }
+            when (r) {
+                Api.Reach.REVOKED -> {
+                    Toast.makeText(act, "Ce téléphone a été révoqué : ses clés sont effacées. Appaire-le de nouveau.", Toast.LENGTH_LONG).show()
+                    act.logoutPellicule()
                 }
+                else -> act.reloadLater()
             }
-        }.start()
+        }
     }
 
     @JavascriptInterface

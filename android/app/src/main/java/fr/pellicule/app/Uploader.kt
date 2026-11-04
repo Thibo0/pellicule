@@ -36,8 +36,12 @@ class Uploader(private val ctx: Context, private val api: Api, private val mk: B
     private fun input(item: MediaItem): InputStream =
         ctx.contentResolver.openInputStream(uriOf(item)) ?: throw IOException("fichier illisible")
 
-    /** Renvoie "created" ou "duplicate". */
-    fun upload(item: MediaItem): String {
+    enum class Outcome {
+        CREATED,
+        DUPLICATE, // déjà sur le serveur (même contenu) : rien n'a été envoyé
+    }
+
+    fun upload(item: MediaItem): Outcome {
         // 1. empreinte (et taille réelle : celle de MediaStore peut différer)
         val hasher = Crypto.ContentHasher()
         var size = 0L
@@ -68,7 +72,7 @@ class Uploader(private val ctx: Context, private val api: Api, private val mk: B
             .put("fk", Api.b64(Crypto.seal(mk, fk, Crypto.L.FK)))
             .put("meta", Api.b64(Crypto.seal(fk, meta.toString().toByteArray(), Crypto.L.META)))
         var r = api.postJson("/api/assets", createBody)
-        if (r.getString("status") == "duplicate") return "duplicate"
+        if (r.getString("status") == "duplicate") return Outcome.DUPLICATE
         val id = r.getLong("id")
         th.thumb?.let { api.put("/api/assets/$id/thumb", Crypto.seal(fk, it, Crypto.L.THUMB)) }
         th.preview?.let { api.put("/api/assets/$id/preview", Crypto.seal(fk, it, Crypto.L.PREVIEW)) }
@@ -85,12 +89,12 @@ class Uploader(private val ctx: Context, private val api: Api, private val mk: B
                 // position refusée (envoi concurrent, morceau perdu…) : on redemande où en est le serveur
                 if (++attempts > 3) throw IOException("envoi désynchronisé")
                 r = api.postJson("/api/assets", createBody)
-                if (r.getString("status") == "duplicate") return "duplicate"
+                if (r.getString("status") == "duplicate") return Outcome.DUPLICATE
                 r.optLong("uploaded", 0)
             }
         }
         api.postJson("/api/assets/$id/complete", JSONObject())
-        return "created"
+        return Outcome.CREATED
     }
 
     /** Envoie à partir du bloc firstChunk ; renvoie la nouvelle position, ou null si le serveur attend une autre position. */
@@ -175,14 +179,14 @@ object Thumbs {
             } // l'orientation EXIF est appliquée par ImageDecoder
         } else {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            ctx.contentResolver.openInputStream(uri)!!.use { BitmapFactory.decodeStream(it, null, bounds) }
+            open(ctx, uri).use { BitmapFactory.decodeStream(it, null, bounds) }
             w = bounds.outWidth; h = bounds.outHeight
             var sample = 1
             while (maxOf(w, h) / (sample * 2) >= 1600) sample *= 2
-            val raw = ctx.contentResolver.openInputStream(uri)!!.use {
+            val raw = open(ctx, uri).use {
                 BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
             } ?: throw IOException("image illisible")
-            val rot = ctx.contentResolver.openInputStream(uri)!!.use {
+            val rot = open(ctx, uri).use {
                 when (ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
                     ExifInterface.ORIENTATION_ROTATE_90 -> 90f
                     ExifInterface.ORIENTATION_ROTATE_180 -> 180f
@@ -214,6 +218,10 @@ object Thumbs {
             r.release()
         }
     }
+
+    /** Flux du fichier ; IOException s'il a disparu entre-temps (make retombe alors sur « pas de vignette »). */
+    private fun open(ctx: Context, uri: Uri): InputStream =
+        ctx.contentResolver.openInputStream(uri) ?: throw IOException("fichier illisible")
 
     private fun fit(b: Bitmap, max: Int): Bitmap {
         val s = minOf(1.0, max.toDouble() / maxOf(b.width, b.height))

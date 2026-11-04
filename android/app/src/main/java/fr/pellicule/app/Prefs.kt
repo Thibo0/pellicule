@@ -7,21 +7,21 @@ class Prefs(ctx: Context) {
     private val sp = ctx.applicationContext.getSharedPreferences("pellicule", Context.MODE_PRIVATE)
 
     var server: String
-        get() = sp.getString("server", "")!!
+        get() = sp.getString("server", "").orEmpty()
         set(v) = sp.edit().putString("server", v).apply()
 
     /** Empreinte SHA-256 (hex) du certificat du serveur, épinglée à l'appairage. */
     var fingerprint: String
-        get() = sp.getString("fingerprint", "")!!
+        get() = sp.getString("fingerprint", "").orEmpty()
         set(v) = sp.edit().putString("fingerprint", v).apply()
 
     /** Clé maître du compte, chiffrée par une clé du Keystore (voir Keys). */
     var wrappedMK: String
-        get() = sp.getString("wrappedMK", "")!!
+        get() = sp.getString("wrappedMK", "").orEmpty()
         set(v) = sp.edit().putString("wrappedMK", v).commit().let { }
 
     var username: String
-        get() = sp.getString("username", "")!!
+        get() = sp.getString("username", "").orEmpty()
         set(v) = sp.edit().putString("username", v).apply()
 
     var backupEnabled: Boolean
@@ -34,7 +34,7 @@ class Prefs(ctx: Context) {
 
     /** Dossiers (albums du téléphone) à sauvegarder ; null = choix par défaut (appareil photo). */
     var buckets: Set<String>?
-        get() = if (sp.contains("buckets")) sp.getStringSet("buckets", emptySet())!!.toSet() else null
+        get() = if (sp.contains("buckets")) sp.getStringSet("buckets", emptySet()).orEmpty().toSet() else null
         set(v) = sp.edit().apply { if (v == null) remove("buckets") else putStringSet("buckets", v) }.apply()
 
     var lastRun: Long
@@ -42,7 +42,7 @@ class Prefs(ctx: Context) {
         set(v) = sp.edit().putLong("lastRun", v).apply()
 
     var lastResult: String
-        get() = sp.getString("lastResult", "")!!
+        get() = sp.getString("lastResult", "").orEmpty()
         set(v) = sp.edit().putString("lastResult", v).apply()
 
     var running: Boolean

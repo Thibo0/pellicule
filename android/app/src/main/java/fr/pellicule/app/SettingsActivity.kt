@@ -17,6 +17,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.enableEdgeToEdge
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -26,6 +27,7 @@ class SettingsActivity : ComponentActivity() {
     private lateinit var folders: LinearLayout
     private lateinit var status: android.widget.TextView
     private lateinit var battery: LinearLayout
+    private var foldersJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -127,7 +129,7 @@ class SettingsActivity : ComponentActivity() {
     }
 
     private fun refreshStatus() {
-        val done = UploadedDb(this).count()
+        val done = UploadedDb.of(this).count()
         val last = ago(prefs.lastRun)
         status.text = when {
             !prefs.backupEnabled -> "Sauvegarde automatique désactivée."
@@ -168,7 +170,9 @@ class SettingsActivity : ComponentActivity() {
             return
         }
         folders.addView(label("Chargement…", 14f, muted = true))
-        lifecycleScope.launch {
+        // un chargement plus ancien (option vidéos basculée entre-temps) ne doit pas écraser le plus récent
+        foldersJob?.cancel()
+        foldersJob = lifecycleScope.launch {
             val (buckets, chosen) = withContext(Dispatchers.IO) {
                 val items = Media.all(this@SettingsActivity, prefs.includeVideos)
                 val counts = items.groupingBy { it.bucket }.eachCount().toList().sortedByDescending { it.second }
