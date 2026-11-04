@@ -47,6 +47,7 @@ func (a *App) routes() http.Handler {
 	m.HandleFunc("PUT /api/assets/{id}/preview", a.auth(a.putSmallBlob("m", "has_preview", maxPreview)))
 	m.HandleFunc("POST /api/assets/{id}/complete", a.auth(a.handleCompleteAsset))
 	m.HandleFunc("POST /api/assets/check", a.auth(a.handleCheck))
+	m.HandleFunc("GET /api/assets/resend", a.auth(a.handleResend))
 	m.HandleFunc("POST /api/assets/keys", a.auth(a.handleRewrapKeys))
 	m.HandleFunc("GET /api/timeline", a.auth(a.handleTimeline))
 	m.HandleFunc("GET /api/assets/{id}", a.auth(a.handleAsset))

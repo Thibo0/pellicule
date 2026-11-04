@@ -9,6 +9,9 @@ import (
 // janitor : corbeille vidée après 30 jours, envois abandonnés, jetons expirés, fichiers temporaires.
 func (a *App) janitor() {
 	for round := 0; ; round++ {
+		if round == 0 {
+			a.checkOriginals()
+		}
 		if round%4 == 0 { // au démarrage, puis une fois par jour
 			a.syncFiles()
 		}

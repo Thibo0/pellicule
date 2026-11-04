@@ -124,8 +124,12 @@ class BackupWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
     private suspend fun send(ctx: Context, api: Api, mk: ByteArray) {
         val up = Uploader(ctx, api, mk)
         val db = UploadedDb.of(ctx)
+        val all = Media.toBackup(ctx, prefs)
+        // originaux abîmés côté serveur (ancien bug d'envoi) : on oublie qu'ils ont été envoyés
+        val resend = runCatching { api.resend() }.getOrDefault(emptySet()) // serveur plus ancien : rien à renvoyer
+        if (resend.isNotEmpty()) all.filter { up.deviceTag(it) in resend }.forEach { db.forget(it) }
         val done = db.doneIds()
-        var todo = Media.toBackup(ctx, prefs).filter { done[it.id] != it.size }
+        var todo = all.filter { done[it.id] != it.size }
 
         // ce qui est déjà sur le serveur (envoyé depuis le navigateur…) n'est pas renvoyé ; le serveur ne voit
         // que des HMAC du nom et de la taille, pas les noms

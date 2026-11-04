@@ -268,14 +268,32 @@ func (a *App) importFile(u importUser, path, kind, mime string, info fs.FileInfo
 	return nil
 }
 
+// openInLibrary ouvre un fichier du dossier des photos sans jamais sortir de ce dossier, même si un
+// composant du chemin devient un lien entre le parcours et l'ouverture (os.Root : openat composant par
+// composant). Sans ça, qui peut écrire sur le partage pourrait faire chiffrer pour son propre compte la base
+// ou la clé TLS de la VM, en remplaçant au bon moment un fichier déposé dans Import/ par un lien.
+func (a *App) openInLibrary(p string) (*os.File, error) {
+	rel, err := filepath.Rel(a.libDir, p)
+	if err != nil || !filepath.IsLocal(rel) {
+		return nil, errors.New("hors du dossier des photos")
+	}
+	root, err := os.OpenRoot(a.libDir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close() // le fichier ouvert reste valide
+	return root.Open(rel)
+}
+
 // encryptFileTo chiffre src dans dst et renvoie l'empreinte du contenu en clair (la même que celle des clients).
 func (a *App) encryptFileTo(src string, fk []byte, dst string) ([]byte, error) {
-	in, err := os.Open(src)
+	in, err := a.openInLibrary(src)
 	if err != nil {
 		return nil, err
 	}
 	defer in.Close()
-	// le fichier a pu être remplacé par un lien entre le parcours et l'ouverture
+	// le fichier a pu être remplacé par un lien entre le parcours et l'ouverture : openInLibrary refuse tout
+	// lien qui sortirait du dossier des photos ; les contrôles ci-dessous écartent en plus les liens internes
 	if st, err := in.Stat(); err != nil || !st.Mode().IsRegular() {
 		return nil, errors.New("pas un fichier ordinaire")
 	}

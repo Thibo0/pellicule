@@ -79,3 +79,44 @@ func TestEnvoiDepuisLAppApresImportEstUnDoublon(t *testing.T) {
 		t.Fatalf("dedupTag absent du fichier .k")
 	}
 }
+
+// Le parcours a vu un vrai dossier, puis quelqu'un le remplace par un lien vers la VM avant l'ouverture :
+// le chiffrement refuse de lire hors du dossier des photos (sinon la base finirait chiffrée pour son compte).
+func TestImportNeSortJamaisDuDossierDesPhotos(t *testing.T) {
+	app, _, _ := setupAdmin(t)
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "x.jpg"), []byte("\xff\xd8\xff base de la VM"), 0o600)
+	dir := filepath.Join(app.libDir, importDir, "alice")
+	os.MkdirAll(dir, 0o755)
+	if err := os.Symlink(outside, filepath.Join(dir, "sub")); err != nil {
+		t.Skip("liens symboliques indisponibles ici :", err)
+	}
+	dst := filepath.Join(t.TempDir(), "o")
+	if _, err := app.encryptFileTo(filepath.Join(dir, "sub", "x.jpg"), randomBytes(KeySize), dst); err == nil {
+		t.Fatal("fichier hors du dossier des photos chiffré")
+	}
+	if _, err := os.Stat(dst); err == nil {
+		t.Fatal("original écrit malgré le refus")
+	}
+	// un fichier ordinaire du dossier d'import passe toujours
+	ok := filepath.Join(dir, "ok.jpg")
+	os.WriteFile(ok, []byte("\xff\xd8\xff photo"), 0o644)
+	if _, err := app.encryptFileTo(ok, randomBytes(KeySize), dst); err != nil {
+		t.Fatalf("fichier ordinaire refusé : %v", err)
+	}
+}
+
+// Si l'original déjà sauvegardé est abîmé (tronqué par l'ancien bug d'envoi), la copie importée est gardée.
+func TestImportGardeLaCopieSiLOriginalEstAbime(t *testing.T) {
+	app, _, c := setupAdmin(t)
+	content := []byte("\xff\xd8\xff\xe0 original abîmé sur le serveur")
+	first, _ := c.upload("IMG_3.jpg", content)
+	os.Truncate(app.blobPath(1, first, "o"), 10)
+	id, box := importOne(t, app, c, "IMG_3.jpg", content)
+	if out := clientRewrap(t, c, id, box); out["duplicates"].(float64) != 0 {
+		t.Fatalf("bonne copie supprimée au profit d'un original abîmé : %v", out)
+	}
+	if n := countAssets(app); n != 2 {
+		t.Fatalf("%d éléments au lieu de 2", n)
+	}
+}

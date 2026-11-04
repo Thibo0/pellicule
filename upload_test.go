@@ -189,3 +189,64 @@ func TestGrosseSelectionEcritLesFichiersEnFond(t *testing.T) {
 		t.Fatalf("fichier de clé : %v %s", err, b)
 	}
 }
+
+// Original tronqué par une ancienne version : repéré au démarrage, puis remplacé quand le téléphone le renvoie,
+// sans perdre l'élément (même id, albums et favori conservés).
+func TestOriginalAbimeEstRepareParLeTelephone(t *testing.T) {
+	app, _, c := setupAdmin(t)
+	content := bytes.Repeat([]byte("souvenir "), 200_000)
+	id, _ := c.upload("IMG_R.jpg", content)
+	app.db.Exec(`UPDATE assets SET favorite=1 WHERE id=?`, id)
+	os.WriteFile(filepath.Join(app.libDir, ".pellicule-library"), nil, 0o644)
+	os.Truncate(app.blobPath(1, id, "o"), 500_000)
+
+	app.checkOriginals()
+	if app.files.damagedCount() != 1 {
+		t.Fatalf("original abîmé non repéré (%d)", app.files.damagedCount())
+	}
+	var dev string
+	app.db.QueryRow(`SELECT device_tag FROM assets WHERE id=?`, id).Scan(&dev)
+	if _, out, _ := c.do("POST", "/api/assets/check", map[string]any{"tags": []string{dev}}); len(out["existing"].([]any)) != 0 {
+		t.Fatal("le téléphone croirait toujours la photo sauvegardée")
+	}
+	if _, out, _ := c.do("GET", "/api/assets/resend", nil); len(out["tags"].([]any)) != 1 || out["tags"].([]any)[0] != dev {
+		t.Fatalf("photo à renvoyer non signalée : %v", out)
+	}
+
+	// le téléphone la renvoie : même élément, original réparé
+	again, status := c.upload("IMG_R.jpg", content)
+	if again != id || status != "resume" {
+		t.Fatalf("renvoi : id %d (attendu %d), %s", again, id, status)
+	}
+	var fav bool
+	app.db.QueryRow(`SELECT favorite FROM assets WHERE id=?`, id).Scan(&fav)
+	if !fav {
+		t.Fatal("favori perdu pendant la réparation")
+	}
+	m, _ := filepath.Glob(filepath.Join(app.libDir, "u*", "*", itoa(id)+".o"))
+	if len(m) != 1 {
+		t.Fatal("original absent après réparation")
+	}
+	if app.files.damagedCount() != 0 {
+		t.Fatal("toujours signalée après réparation")
+	}
+	if _, out, _ := c.do("GET", "/api/assets/resend", nil); len(out["tags"].([]any)) != 0 {
+		t.Fatal("toujours à renvoyer après réparation")
+	}
+}
+
+// Un original absent (partage décroché…) ne déclenche rien : pas de renvoi ni d'effacement sur un doute.
+func TestOriginalAbsentNeDeclencheRien(t *testing.T) {
+	app, _, c := setupAdmin(t)
+	content := []byte("photo sur un partage décroché")
+	id, _ := c.upload("IMG_A.jpg", content)
+	os.WriteFile(filepath.Join(app.libDir, ".pellicule-library"), nil, 0o644)
+	os.Rename(app.blobPath(1, id, "o"), app.blobPath(1, id, "o")+".ailleurs")
+	app.checkOriginals()
+	if app.files.damagedCount() != 0 {
+		t.Fatal("fichier absent traité comme abîmé")
+	}
+	if _, status := c.upload("IMG_A.jpg", content); status != "duplicate" {
+		t.Fatalf("renvoi : %s", status)
+	}
+}

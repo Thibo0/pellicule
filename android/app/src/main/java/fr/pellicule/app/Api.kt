@@ -136,6 +136,12 @@ class Api(private val server: String, private val pin: String) {
     // --- sauvegarde ---
 
     /** Parmi ces empreintes (HMAC du nom et de la taille), lesquelles sont déjà sur le serveur ? */
+    /** Photos notées « envoyées » dont le serveur a trouvé l'original abîmé : à renvoyer. */
+    fun resend(): Set<String> {
+        val arr = getJson("/api/assets/resend").getJSONArray("tags")
+        return (0 until arr.length()).map { arr.getString(it) }.toSet()
+    }
+
     fun check(tags: List<String>): Set<String> {
         val arr = postJson("/api/assets/check", JSONObject().put("tags", JSONArray(tags))).getJSONArray("existing")
         return (0 until arr.length()).map { arr.getString(it) }.toSet()

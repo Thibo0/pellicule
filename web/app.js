@@ -1461,6 +1461,9 @@ async function viewSettings(stale) {
         : s.files.lastSync ? `Reprise après perte de la VM : fichiers vérifiés le ${esc(new Date(s.files.lastSync).toLocaleString('fr-FR', { dateStyle: 'long', timeStyle: 'short' }))}.`
         : 'Reprise après perte de la VM : première vérification en cours.'}
         <br><span class="hint">Si la VM est perdue, chaque compte se reprend avec sa clé de secours.</span></p>
+        ${s.files.damaged > 0 ? `<p><b>⚠ ${esc(plural(s.files.damaged, 'original abîmé', 'originaux abîmés'))}</b>
+          (envoi interrompu, versions antérieures à la 0.5.1). Chaque téléphone qui a encore la photo la renvoie tout seul ;
+          le détail est dans le journal du serveur.</p>` : ''}
         ${s.files.oddNames?.length ? `<p><b>⚠ Noms de compte hors des règles actuelles :</b> ${s.files.oddNames.map(esc).join(', ')}.
           <span class="hint">Créés avec une version plus ancienne. Vérifie qu’aucun n’imite le nom de quelqu’un d’autre.</span></p>` : ''}` : ''}
       ${me.certFingerprint ? `<p>Empreinte du certificat :<br><code class="fp">${esc(me.certFingerprint)}</code><br>

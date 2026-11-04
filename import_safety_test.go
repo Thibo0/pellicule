@@ -88,7 +88,7 @@ func TestImportRefuseUnFauxFichier(t *testing.T) {
 func TestImportFichierPoison(t *testing.T) {
 	app, _, _ := setupAdmin(t)
 	// un premier essai interrompu (arrêt normal pendant une mise à jour) : le fichier est retenté
-	p := dropImport(t, app, "a.jpg", "\xff\xd8\xff\xe0 photo")
+	dropImport(t, app, "a.jpg", "\xff\xd8\xff\xe0 photo")
 	app.db.Exec(`INSERT INTO import_running(path, attempts) VALUES ('Import/alice/a.jpg', 1)`)
 	app.scanImports()
 	if countAssets(app) != 1 {
@@ -100,7 +100,7 @@ func TestImportFichierPoison(t *testing.T) {
 		t.Fatal("import terminé encore marqué en cours")
 	}
 	// deux essais interrompus (le serveur plante dessus) : mis de côté, pas de boucle de plantages
-	p = dropImport(t, app, "b.jpg", "\xff\xd8\xff\xe0 poison")
+	p := dropImport(t, app, "b.jpg", "\xff\xd8\xff\xe0 poison")
 	app.db.Exec(`INSERT INTO import_running(path, attempts) VALUES ('Import/alice/b.jpg', 2)`)
 	app.scanImports()
 	if countAssets(app) != 1 {

@@ -139,4 +139,6 @@ class UploadedDb private constructor(ctx: Context) : SQLiteOpenHelper(ctx.applic
     fun count(): Long = readableDatabase.compileStatement("SELECT COUNT(*) FROM done").simpleQueryForLong()
 
     fun clear() = writableDatabase.execSQL("DELETE FROM done")
+
+    fun forget(item: MediaItem) = writableDatabase.execSQL("DELETE FROM done WHERE media_id = ?", arrayOf(item.id))
 }

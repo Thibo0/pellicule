@@ -193,10 +193,6 @@ func vipsVersionOK(out string) (string, bool) {
 	return m[0], major > 8 || (major == 8 && minor >= 13)
 }
 
-func (t tools) summary() map[string]bool {
-	return map[string]bool{"vips": t.vipsthumbnail != "", "ffmpeg": t.ffmpeg != "" && t.ffprobe != ""}
-}
-
 func (t tools) report() {
 	if t.vipsTooOld != "" {
 		log.Printf("libvips %s ignoré : il faut la version 8.13 ou plus pour bloquer les décodeurs non sûrs "+

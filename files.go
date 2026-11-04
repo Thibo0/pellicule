@@ -152,6 +152,24 @@ func (s *filesState) drain(a *App) {
 	}
 }
 
+func (s *filesState) isDamaged(id int64) bool {
+	s.dmu.Lock()
+	defer s.dmu.Unlock()
+	return s.damaged[id]
+}
+
+func (s *filesState) repaired(id int64) {
+	s.dmu.Lock()
+	delete(s.damaged, id)
+	s.dmu.Unlock()
+}
+
+func (s *filesState) damagedCount() int {
+	s.dmu.Lock()
+	defer s.dmu.Unlock()
+	return len(s.damaged)
+}
+
 // pendingWrites : éléments encore dans la file d'écriture (tests, Réglages).
 func (s *filesState) pendingWrites() int {
 	s.qmu.Lock()
@@ -268,14 +286,17 @@ type filesState struct {
 	last   atomic.Int64 // fin de la dernière vérification complète (ms), 0 = pas encore
 	failed atomic.Int64 // écritures ratées depuis le début de cette vérification
 
-	wmu      sync.Mutex // écriture d'un fichier de clé
-	qmu      sync.Mutex // file d'écriture en tâche de fond
+	dmu      sync.Mutex
+	damaged  map[int64]bool // originaux de taille incorrecte (checkOriginals), retirés une fois réparés
+	wmu      sync.Mutex     // écriture d'un fichier de clé
+	qmu      sync.Mutex     // file d'écriture en tâche de fond
 	queue    map[int64]struct{}
 	draining bool
 }
 
 func (a *App) filesStatus() map[string]any {
 	return map[string]any{"lastSync": a.files.last.Load(), "failed": a.files.failed.Load(), "pending": a.files.pendingWrites(),
+		"damaged":  a.files.damagedCount(),
 		"oddNames": a.oddUsernames()}
 }
 
@@ -295,6 +316,50 @@ func (a *App) oddUsernames() []string {
 		}
 	}
 	return out
+}
+
+// originalDamaged : vrai seulement si l'original est là et n'a PAS la taille attendue. Un fichier absent ou
+// illisible (partage décroché…) ne compte pas : on ne déclenche jamais un renvoi sur un simple doute.
+func (a *App) originalDamaged(owner, id, size int64) bool {
+	st, err := os.Stat(a.blobPath(owner, id, "o"))
+	return err == nil && st.Size() != size
+}
+
+// checkOriginals : les versions antérieures à la 0.5.1 pouvaient tronquer un original pendant l'envoi (requête bloquée qui
+// échouait après coup) tout en le marquant sauvegardé. On les repère au démarrage : /api/assets/check ne les
+// compte plus comme sauvegardés et /api/assets/resend les signale à l'app (qui les a notés « envoyés »).
+// Le téléphone qui a encore la photo la renvoie, et handleCreateAsset remplace l'original abîmé.
+func (a *App) checkOriginals() {
+	if _, err := os.Stat(filepath.Join(a.libDir, ".pellicule-library")); err != nil {
+		return // disque des photos absent : rien à conclure
+	}
+	type item struct{ id, owner, size int64 }
+	var items []item
+	rows, err := a.db.Query(`SELECT id, owner_id, orig_size FROM assets WHERE complete=1 AND fk_sealed=0`)
+	if err != nil {
+		return
+	}
+	for rows.Next() {
+		var it item
+		if rows.Scan(&it.id, &it.owner, &it.size) == nil {
+			items = append(items, it)
+		}
+	}
+	rows.Close()
+	var bad []int64
+	set := map[int64]bool{}
+	for _, it := range items {
+		if a.originalDamaged(it.owner, it.id, it.size) {
+			bad = append(bad, it.id)
+			set[it.id] = true
+		}
+	}
+	a.files.dmu.Lock()
+	a.files.damaged = set
+	a.files.dmu.Unlock()
+	if len(bad) > 0 {
+		log.Printf("originaux abîmés (taille incorrecte) : %v ; ils seront remplacés si un téléphone les a encore", bad)
+	}
 }
 
 func (a *App) syncFiles() {

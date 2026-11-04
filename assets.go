@@ -75,12 +75,34 @@ func (a *App) handleCreateAsset(w http.ResponseWriter, r *http.Request, u *User)
 		return
 	}
 
-	var id, uploaded int64
+	var id, uploaded, size int64
 	var complete bool
 	var trashed sql.NullInt64
-	err := a.db.QueryRow(`SELECT id, uploaded, complete, trashed_at FROM assets WHERE owner_id=? AND dedup_tag=?`, u.ID, b.DedupTag).
-		Scan(&id, &uploaded, &complete, &trashed)
+	err := a.db.QueryRow(`SELECT id, uploaded, complete, trashed_at, orig_size FROM assets WHERE owner_id=? AND dedup_tag=?`, u.ID, b.DedupTag).
+		Scan(&id, &uploaded, &complete, &trashed, &size)
 	switch {
+	case err == nil && complete && size == b.Size && a.originalDamaged(u.ID, id, size):
+		// original tronqué par une ancienne version (voir checkOriginals) : le téléphone a la photo, on
+		// repart de zéro sur le même élément (albums, favori et date conservés). La clé est la même (dérivée
+		// du contenu). created_at est rafraîchi, sinon le nettoyage des envois abandonnés l'effacerait.
+		if !a.uploads.try(id) {
+			httpError(w, http.StatusConflict, "envoi déjà en cours")
+			return
+		}
+		os.Remove(a.blobPath(u.ID, id, "o.part"))
+		_, err := a.db.Exec(`UPDATE assets SET complete=0, uploaded=0, device_tag=?, created_at=? WHERE id=?`,
+			b.DeviceTag, time.Now().UnixMilli(), id)
+		if err == nil {
+			err = os.Remove(a.blobPath(u.ID, id, "o"))
+		}
+		a.uploads.release(id)
+		if err != nil {
+			serverError(w, err)
+			return
+		}
+		log.Printf("original #%d abîmé : renvoyé par le téléphone", id)
+		writeJSON(w, map[string]any{"status": "resume", "id": id, "uploaded": 0})
+		return
 	case err == nil && complete:
 		if trashed.Valid { // renvoyer une photo mise à la corbeille la restaure
 			a.db.Exec(`UPDATE assets SET trashed_at=NULL WHERE id=?`, id)
@@ -334,6 +356,7 @@ func (a *App) handleCompleteAsset(w http.ResponseWriter, r *http.Request, u *Use
 		return
 	}
 	a.db.Exec(`UPDATE assets SET complete=1 WHERE id=?`, id)
+	a.files.repaired(id)
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -357,15 +380,18 @@ func (a *App) handleCheck(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	known := map[string]bool{}
-	rows, err := a.db.Query(`SELECT device_tag FROM assets WHERE owner_id=? AND complete=1 AND device_tag<>''`, u.ID)
+	rows, err := a.db.Query(`SELECT id, device_tag FROM assets WHERE owner_id=? AND complete=1 AND device_tag<>''`, u.ID)
 	if err != nil {
 		serverError(w, err)
 		return
 	}
 	for rows.Next() {
+		var id int64
 		var k string
-		rows.Scan(&k)
-		known[k] = true
+		rows.Scan(&id, &k)
+		if !a.files.isDamaged(id) { // original abîmé : à renvoyer, donc pas « déjà sauvegardé »
+			known[k] = true
+		}
 	}
 	rows.Close()
 	out := []string{}
@@ -375,6 +401,26 @@ func (a *App) handleCheck(w http.ResponseWriter, r *http.Request, u *User) {
 		}
 	}
 	writeJSON(w, map[string]any{"existing": out})
+}
+
+// handleResend : empreintes d'appareil des photos du compte dont l'original est abîmé (voir checkOriginals).
+// L'app les retire de sa liste « déjà envoyées » pour les renvoyer.
+func (a *App) handleResend(w http.ResponseWriter, r *http.Request, u *User) {
+	out := []string{}
+	rows, err := a.db.Query(`SELECT id, device_tag FROM assets WHERE owner_id=? AND complete=1 AND device_tag<>''`, u.ID)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var k string
+		if rows.Scan(&id, &k) == nil && a.files.isDamaged(id) {
+			out = append(out, k)
+		}
+	}
+	writeJSON(w, map[string]any{"tags": out})
 }
 
 // handleRewrapKeys : l'import a scellé la clé du fichier pour la clé publique du compte ; le client,
@@ -427,6 +473,14 @@ func (a *App) dedupImported(owner, id int64, tag string) bool {
 		return false
 	}
 	if err != nil || !complete { // envoi de l'app en cours : on garde les deux, sans étiquette pour celle-ci
+		return false
+	}
+	// l'autre copie doit être intacte : un original tronqué (bug d'envoi des versions antérieures à la 0.5.1) ne doit pas
+	// faire supprimer la bonne copie importée
+	var size int64
+	a.db.QueryRow(`SELECT orig_size FROM assets WHERE id=?`, other).Scan(&size)
+	if st, err := os.Stat(a.blobPath(owner, other, "o")); err != nil || st.Size() != size {
+		log.Printf("import #%d : même photo que #%d, dont l'original est abîmé ; les deux sont gardées", id, other)
 		return false
 	}
 	var kept bool
